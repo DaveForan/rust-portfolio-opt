@@ -10,7 +10,7 @@
 //! - **Rounded** — simply rounds each allocation to the nearest whole
 //!   share (may violate the budget slightly).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use nalgebra::{DMatrix, DVector};
 
@@ -28,6 +28,28 @@ pub fn get_latest_prices(prices: &DMatrix<f64>) -> Result<DVector<f64>> {
         ));
     }
     Ok(prices.row(rows - 1).transpose().into_owned())
+}
+
+/// Ticker-labeled version of [`get_latest_prices`]. Returns an
+/// alphabetically-ordered `BTreeMap<String, f64>` you can pass straight
+/// into [`DiscreteAllocation::new_labeled`].
+pub fn get_latest_prices_labeled(
+    prices: &DMatrix<f64>,
+    tickers: &[String],
+) -> Result<BTreeMap<String, f64>> {
+    if prices.ncols() != tickers.len() {
+        return Err(PortfolioError::DimensionMismatch(format!(
+            "prices has {} columns but {} tickers were supplied",
+            prices.ncols(),
+            tickers.len()
+        )));
+    }
+    let latest = get_latest_prices(prices)?;
+    Ok(tickers
+        .iter()
+        .zip(latest.iter())
+        .map(|(t, v)| (t.clone(), *v))
+        .collect())
 }
 
 /// Converts continuous portfolio weights into integer share counts.
@@ -55,6 +77,10 @@ pub struct DiscreteAllocation {
     /// 130/30). When `None`, derived from the weights as
     /// `sum(-w for w in weights if w < 0)`.
     pub short_ratio: Option<f64>,
+    /// Optional ticker labels (parallel to `weights` / `prices`). Set when
+    /// the allocator was built from labeled inputs via
+    /// [`DiscreteAllocation::new_labeled`].
+    pub tickers: Option<Vec<String>>,
 }
 
 impl DiscreteAllocation {
@@ -88,7 +114,51 @@ impl DiscreteAllocation {
             prices,
             total_portfolio_value,
             short_ratio: None,
+            tickers: None,
         })
+    }
+
+    /// Ticker-keyed constructor mirroring PyPortfolioOpt's
+    /// `DiscreteAllocation(weights, latest_prices, total_portfolio_value)`.
+    ///
+    /// `weights` and `latest_prices` are aligned by ticker — only tickers
+    /// present in *both* maps are kept. The internal asset ordering is the
+    /// alphabetical order of the intersection (preserved on `self.tickers`).
+    ///
+    /// # Example
+    /// ```
+    /// use std::collections::BTreeMap;
+    /// use rust_portfolio_opt::discrete_allocation::DiscreteAllocation;
+    ///
+    /// let weights: BTreeMap<String, f64> =
+    ///     [("AAPL".into(), 0.6), ("MSFT".into(), 0.4)].into_iter().collect();
+    /// let prices: BTreeMap<String, f64> =
+    ///     [("AAPL".into(), 100.0), ("MSFT".into(), 50.0)].into_iter().collect();
+    /// let da = DiscreteAllocation::new_labeled(weights, prices, 10_000.0).unwrap();
+    /// let (shares, leftover) = da.greedy_portfolio_labeled().unwrap();
+    /// assert!(leftover >= 0.0);
+    /// assert!(shares.contains_key("AAPL"));
+    /// ```
+    pub fn new_labeled(
+        weights: BTreeMap<String, f64>,
+        latest_prices: BTreeMap<String, f64>,
+        total_portfolio_value: f64,
+    ) -> Result<Self> {
+        let tickers: Vec<String> = weights
+            .keys()
+            .filter(|t| latest_prices.contains_key(*t))
+            .cloned()
+            .collect();
+        if tickers.is_empty() {
+            return Err(PortfolioError::InvalidArgument(
+                "weights and latest_prices share no common tickers".into(),
+            ));
+        }
+        let w = DVector::from_iterator(tickers.len(), tickers.iter().map(|t| weights[t]));
+        let p = DVector::from_iterator(tickers.len(), tickers.iter().map(|t| latest_prices[t]));
+        let mut da = Self::new(w, p, total_portfolio_value)?;
+        da.tickers = Some(tickers);
+        Ok(da)
     }
 
     /// Override the short ratio (e.g. 0.3 for a 130/30 portfolio).
@@ -222,6 +292,62 @@ impl DiscreteAllocation {
             .iter()
             .map(|(&i, &s)| s as f64 * self.prices[i])
             .sum()
+    }
+
+    fn require_tickers(&self) -> Result<&[String]> {
+        self.tickers.as_deref().ok_or_else(|| {
+            PortfolioError::InvalidArgument(
+                "this DiscreteAllocation has no ticker labels; build with new_labeled to use \
+                 the *_labeled API"
+                    .into(),
+            )
+        })
+    }
+
+    fn relabel_alloc(&self, alloc: HashMap<usize, i64>) -> Result<HashMap<String, i64>> {
+        let tickers = self.require_tickers()?;
+        Ok(alloc
+            .into_iter()
+            .map(|(i, s)| (tickers[i].clone(), s))
+            .collect())
+    }
+
+    /// Ticker-keyed greedy allocation. Mirrors PyPortfolioOpt's
+    /// `DiscreteAllocation.greedy_portfolio()` which returns
+    /// `(allocation_dict, leftover)`.
+    pub fn greedy_portfolio_labeled(&self) -> Result<(HashMap<String, i64>, f64)> {
+        let (alloc, leftover) = self.greedy_portfolio()?;
+        Ok((self.relabel_alloc(alloc)?, leftover))
+    }
+
+    /// Same as [`Self::greedy_portfolio_labeled`] but exposes `reinvest`/`verbose`.
+    pub fn greedy_portfolio_with_options_labeled(
+        &self,
+        reinvest: bool,
+        verbose: bool,
+    ) -> Result<(HashMap<String, i64>, f64)> {
+        let (alloc, leftover) = self.greedy_portfolio_with_options(reinvest, verbose)?;
+        Ok((self.relabel_alloc(alloc)?, leftover))
+    }
+
+    /// Ticker-keyed rounded allocation.
+    pub fn rounded_portfolio_labeled(&self) -> Result<(HashMap<String, i64>, f64)> {
+        let (alloc, leftover) = self.rounded_portfolio()?;
+        Ok((self.relabel_alloc(alloc)?, leftover))
+    }
+
+    /// Total market value of a ticker-keyed allocation.
+    pub fn allocation_value_labeled(&self, allocation: &HashMap<String, i64>) -> Result<f64> {
+        let tickers = self.require_tickers()?;
+        let mut value = 0.0;
+        for (t, &s) in allocation {
+            let i = tickers
+                .iter()
+                .position(|x| x == t)
+                .ok_or_else(|| PortfolioError::InvalidArgument(format!("unknown ticker {t}")))?;
+            value += s as f64 * self.prices[i];
+        }
+        Ok(value)
     }
 }
 
@@ -382,5 +508,70 @@ mod tests {
         let da = DiscreteAllocation::new(weights, prices, 5_000.0).unwrap();
         let (alloc, _) = da.greedy_portfolio().unwrap();
         assert!(!alloc.contains_key(&1));
+    }
+
+    #[test]
+    fn labeled_api_aligns_weights_and_prices_by_ticker() {
+        // weights are inserted MSFT-then-AAPL, prices AAPL-then-MSFT.
+        // BTreeMap iterates alphabetically so internal order = [AAPL, MSFT].
+        let mut weights = BTreeMap::new();
+        weights.insert("MSFT".to_string(), 0.4);
+        weights.insert("AAPL".to_string(), 0.6);
+        let mut prices = BTreeMap::new();
+        prices.insert("AAPL".to_string(), 100.0);
+        prices.insert("MSFT".to_string(), 50.0);
+        let da = DiscreteAllocation::new_labeled(weights, prices, 10_000.0).unwrap();
+        assert_eq!(da.tickers.as_deref().unwrap(), &["AAPL", "MSFT"]);
+        let (shares, leftover) = da.greedy_portfolio_labeled().unwrap();
+        assert!(leftover >= -1e-9);
+        // 60% of 10k @ $100 = 60 AAPL; 40% of 10k @ $50 = 80 MSFT.
+        assert_eq!(*shares.get("AAPL").unwrap(), 60);
+        assert_eq!(*shares.get("MSFT").unwrap(), 80);
+    }
+
+    #[test]
+    fn labeled_api_intersects_ticker_sets() {
+        let mut weights = BTreeMap::new();
+        weights.insert("AAPL".to_string(), 0.5);
+        weights.insert("MSFT".to_string(), 0.5);
+        let mut prices = BTreeMap::new();
+        prices.insert("AAPL".to_string(), 100.0);
+        // MSFT missing.
+        prices.insert("GOOG".to_string(), 200.0);
+        let da = DiscreteAllocation::new_labeled(weights, prices, 1_000.0).unwrap();
+        // Only AAPL is in both.
+        assert_eq!(da.tickers.as_deref().unwrap(), &["AAPL"]);
+    }
+
+    #[test]
+    fn labeled_api_errors_when_no_common_tickers() {
+        let mut weights = BTreeMap::new();
+        weights.insert("AAPL".to_string(), 1.0);
+        let mut prices = BTreeMap::new();
+        prices.insert("MSFT".to_string(), 100.0);
+        assert!(DiscreteAllocation::new_labeled(weights, prices, 1_000.0).is_err());
+    }
+
+    #[test]
+    fn labeled_api_errors_without_tickers() {
+        let weights = DVector::from_vec(vec![0.5, 0.5]);
+        let prices = DVector::from_vec(vec![100.0, 100.0]);
+        let da = DiscreteAllocation::new(weights, prices, 1_000.0).unwrap();
+        assert!(da.greedy_portfolio_labeled().is_err());
+    }
+
+    #[test]
+    fn get_latest_prices_labeled_returns_alphabetical_map() {
+        let prices = dmatrix![
+            100.0, 200.0;
+            101.0, 199.0
+        ];
+        let tickers = vec!["MSFT".to_string(), "AAPL".to_string()];
+        let map = get_latest_prices_labeled(&prices, &tickers).unwrap();
+        // BTreeMap iterates alphabetically.
+        let keys: Vec<&String> = map.keys().collect();
+        assert_eq!(keys, vec!["AAPL", "MSFT"]);
+        assert_relative_eq!(*map.get("MSFT").unwrap(), 101.0);
+        assert_relative_eq!(*map.get("AAPL").unwrap(), 199.0);
     }
 }

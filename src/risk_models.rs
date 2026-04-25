@@ -9,6 +9,7 @@ use nalgebra::{DMatrix, DVector, SymmetricEigen};
 use crate::expected_returns::ReturnsKind;
 use crate::prelude::{
     column_means, log_returns_from_prices, returns_from_prices, sample_covariance, symmetrise,
+    LabeledMatrix,
 };
 use crate::{PortfolioError, Result, TRADING_DAYS_PER_YEAR};
 
@@ -303,6 +304,74 @@ pub fn risk_matrix(
             "unknown risk_matrix method '{other}'"
         ))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Labeled (ticker-aware) wrappers
+// ---------------------------------------------------------------------------
+
+fn validate_labels(prices: &DMatrix<f64>, tickers: &[String]) -> Result<()> {
+    if prices.ncols() != tickers.len() {
+        return Err(PortfolioError::DimensionMismatch(format!(
+            "prices has {} columns but {} tickers were supplied",
+            prices.ncols(),
+            tickers.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Ticker-labeled version of [`sample_cov`]. The returned [`LabeledMatrix`]
+/// uses the same ticker order on both rows and columns.
+pub fn sample_cov_labeled(
+    prices: &DMatrix<f64>,
+    tickers: &[String],
+    kind: ReturnsKind,
+    frequency: Option<usize>,
+) -> Result<LabeledMatrix> {
+    validate_labels(prices, tickers)?;
+    let cov = sample_cov(prices, kind, frequency)?;
+    LabeledMatrix::new(cov, tickers.to_vec())
+}
+
+/// Ticker-labeled version of [`semicovariance`].
+pub fn semicovariance_labeled(
+    prices: &DMatrix<f64>,
+    tickers: &[String],
+    benchmark: Option<f64>,
+    kind: ReturnsKind,
+    frequency: Option<usize>,
+) -> Result<LabeledMatrix> {
+    validate_labels(prices, tickers)?;
+    let cov = semicovariance(prices, benchmark, kind, frequency)?;
+    LabeledMatrix::new(cov, tickers.to_vec())
+}
+
+/// Ticker-labeled version of [`exp_cov`].
+pub fn exp_cov_labeled(
+    prices: &DMatrix<f64>,
+    tickers: &[String],
+    kind: ReturnsKind,
+    span: Option<usize>,
+    frequency: Option<usize>,
+) -> Result<LabeledMatrix> {
+    validate_labels(prices, tickers)?;
+    let cov = exp_cov(prices, kind, span, frequency)?;
+    LabeledMatrix::new(cov, tickers.to_vec())
+}
+
+/// Ticker-labeled version of [`risk_matrix`]. Convenience wrapper that
+/// looks up the named estimator and labels the result.
+pub fn risk_matrix_labeled(
+    prices: &DMatrix<f64>,
+    tickers: &[String],
+    method: &str,
+    kind: ReturnsKind,
+    frequency: Option<usize>,
+) -> Result<LabeledMatrix> {
+    validate_labels(prices, tickers)?;
+    let cov = risk_matrix(prices, method, kind, frequency)?;
+    LabeledMatrix::new(cov, tickers.to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -972,6 +1041,29 @@ mod tests {
         for v in eig.eigenvalues.iter() {
             assert!(*v >= -1e-10, "eigenvalue {v} not >= 0 after repair");
         }
+    }
+
+    #[test]
+    fn labeled_sample_cov_carries_tickers() {
+        let p = make_prices(7);
+        let tickers = vec!["AAPL".into(), "MSFT".into(), "TSLA".into()];
+        let lc = sample_cov_labeled(&p, &tickers, ReturnsKind::Simple, Some(252)).unwrap();
+        assert_eq!(lc.tickers, tickers);
+        let unlabeled = sample_cov(&p, ReturnsKind::Simple, Some(252)).unwrap();
+        for i in 0..3 {
+            for j in 0..3 {
+                assert_relative_eq!(lc.values[(i, j)], unlabeled[(i, j)], max_relative = 1e-12);
+            }
+        }
+        assert!(lc.get("AAPL", "MSFT").is_some());
+        assert!(lc.get("AAPL", "GOOG").is_none());
+    }
+
+    #[test]
+    fn labeled_rejects_mismatched_count() {
+        let p = make_prices(7);
+        let tickers = vec!["AAPL".into(), "MSFT".into()];
+        assert!(sample_cov_labeled(&p, &tickers, ReturnsKind::Simple, None).is_err());
     }
 
     #[test]

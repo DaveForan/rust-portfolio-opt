@@ -15,9 +15,13 @@
 //! [`EfficientFrontier::portfolio_performance`] and
 //! [`EfficientFrontier::clean_weights`] can be called without re-solving.
 
+use std::collections::BTreeMap;
+
 use nalgebra::{DMatrix, DVector};
 
-use crate::prelude::assert_square;
+use crate::prelude::{
+    assert_square, assert_tickers_match, to_weight_map, LabeledMatrix, LabeledVector,
+};
 use crate::qp::{solve, QpProblem, QpSettings};
 use crate::{PortfolioError, Result};
 
@@ -38,6 +42,10 @@ pub struct EfficientFrontier {
     /// Market-neutral mode: enforce `1ᵀw = 0` instead of `1ᵀw = 1`. The
     /// caller must allow negative bounds to make the problem feasible.
     pub market_neutral: bool,
+    /// Optional ticker labels (one per asset). Set via
+    /// [`Self::with_tickers`] or [`Self::from_labeled`]; required by every
+    /// `_labeled` companion method.
+    pub tickers: Option<Vec<String>>,
     weights: Option<DVector<f64>>,
 }
 
@@ -57,7 +65,46 @@ impl EfficientFrontier {
             solver_settings: QpSettings::default(),
             l2_gamma: 0.0,
             market_neutral: false,
+            tickers: None,
             weights: None,
+        })
+    }
+
+    /// Build an [`EfficientFrontier`] from labeled inputs. The ticker
+    /// vectors on `expected_returns` and `cov` must match in both order
+    /// and content; the resulting optimiser remembers them for use by
+    /// every `_labeled` accessor.
+    pub fn from_labeled(expected_returns: LabeledVector, cov: LabeledMatrix) -> Result<Self> {
+        assert_tickers_match(
+            &expected_returns.tickers,
+            &cov.tickers,
+            "EfficientFrontier::from_labeled",
+        )?;
+        let tickers = expected_returns.tickers.clone();
+        let mut ef = Self::new(expected_returns.values, cov.values)?;
+        ef.tickers = Some(tickers);
+        Ok(ef)
+    }
+
+    /// Attach ticker labels to an existing optimiser. Length must match
+    /// the number of assets; mismatched length is an error.
+    pub fn with_tickers(mut self, tickers: Vec<String>) -> Result<Self> {
+        if tickers.len() != self.expected_returns.len() {
+            return Err(PortfolioError::DimensionMismatch(format!(
+                "with_tickers: {} tickers but {} assets",
+                tickers.len(),
+                self.expected_returns.len()
+            )));
+        }
+        self.tickers = Some(tickers);
+        Ok(self)
+    }
+
+    fn require_tickers(&self, label: &str) -> Result<&Vec<String>> {
+        self.tickers.as_ref().ok_or_else(|| {
+            PortfolioError::InvalidArgument(format!(
+                "{label}: no tickers attached — call with_tickers or from_labeled first"
+            ))
         })
     }
 
@@ -292,6 +339,7 @@ impl EfficientFrontier {
                 solver_settings: self.solver_settings,
                 l2_gamma: self.l2_gamma,
                 market_neutral: self.market_neutral,
+                tickers: self.tickers.clone(),
                 weights: None,
             };
             clone.min_volatility()?
@@ -376,6 +424,68 @@ impl EfficientFrontier {
             )
         })?;
         Ok(crate::prelude::clean_weights(w, cutoff, rounding))
+    }
+
+    // -----------------------------------------------------------------------
+    // Labeled (ticker-keyed) companions
+    // -----------------------------------------------------------------------
+
+    /// Ticker-keyed minimum-volatility weights. Errors if no tickers are
+    /// attached. Mirrors PyPortfolioOpt's `EfficientFrontier.min_volatility()`
+    /// returning an `OrderedDict`.
+    pub fn min_volatility_labeled(&mut self) -> Result<BTreeMap<String, f64>> {
+        let w = self.min_volatility()?;
+        let tickers = self.require_tickers("min_volatility_labeled")?;
+        to_weight_map(&w, tickers)
+    }
+
+    /// Ticker-keyed tangency weights.
+    pub fn max_sharpe_labeled(&mut self, risk_free_rate: f64) -> Result<BTreeMap<String, f64>> {
+        let w = self.max_sharpe(risk_free_rate)?;
+        let tickers = self.require_tickers("max_sharpe_labeled")?;
+        to_weight_map(&w, tickers)
+    }
+
+    /// Ticker-keyed max-quadratic-utility weights.
+    pub fn max_quadratic_utility_labeled(
+        &mut self,
+        risk_aversion: f64,
+        market_neutral: Option<bool>,
+    ) -> Result<BTreeMap<String, f64>> {
+        let w = self.max_quadratic_utility(risk_aversion, market_neutral)?;
+        let tickers = self.require_tickers("max_quadratic_utility_labeled")?;
+        to_weight_map(&w, tickers)
+    }
+
+    /// Ticker-keyed minimum-variance-for-target-return weights.
+    pub fn efficient_return_labeled(
+        &mut self,
+        target_return: f64,
+    ) -> Result<BTreeMap<String, f64>> {
+        let w = self.efficient_return(target_return)?;
+        let tickers = self.require_tickers("efficient_return_labeled")?;
+        to_weight_map(&w, tickers)
+    }
+
+    /// Ticker-keyed maximum-return-for-target-volatility weights.
+    pub fn efficient_risk_labeled(
+        &mut self,
+        target_volatility: f64,
+    ) -> Result<BTreeMap<String, f64>> {
+        let w = self.efficient_risk(target_volatility)?;
+        let tickers = self.require_tickers("efficient_risk_labeled")?;
+        to_weight_map(&w, tickers)
+    }
+
+    /// Ticker-keyed cleaned weights.
+    pub fn clean_weights_labeled(
+        &self,
+        cutoff: f64,
+        rounding: Option<u32>,
+    ) -> Result<BTreeMap<String, f64>> {
+        let w = self.clean_weights(cutoff, rounding)?;
+        let tickers = self.require_tickers("clean_weights_labeled")?;
+        to_weight_map(&w, tickers)
     }
 }
 
@@ -519,6 +629,48 @@ mod tests {
         let w = ef.min_volatility().unwrap();
         let total: f64 = w.iter().sum();
         assert!(total.abs() < 1e-3, "1ᵀw = {total} should be ≈ 0");
+    }
+
+    #[test]
+    fn from_labeled_round_trips_to_min_vol_map() {
+        let mu = DVector::from_vec(vec![0.10, 0.15]);
+        let cov = diag(&[1.0, 4.0]);
+        let lv = LabeledVector::new(mu, vec!["AAPL".into(), "MSFT".into()]).unwrap();
+        let lm = LabeledMatrix::new(cov, vec!["AAPL".into(), "MSFT".into()]).unwrap();
+        let mut ef = EfficientFrontier::from_labeled(lv, lm).unwrap();
+        let w = ef.min_volatility_labeled().unwrap();
+        assert_relative_eq!(*w.get("AAPL").unwrap(), 4.0 / 5.0, epsilon = 1e-3);
+        assert_relative_eq!(*w.get("MSFT").unwrap(), 1.0 / 5.0, epsilon = 1e-3);
+    }
+
+    #[test]
+    fn labeled_methods_error_without_tickers() {
+        let mu = DVector::from_vec(vec![0.10, 0.15]);
+        let cov = diag(&[1.0, 4.0]);
+        let mut ef = EfficientFrontier::new(mu, cov).unwrap();
+        assert!(ef.min_volatility_labeled().is_err());
+    }
+
+    #[test]
+    fn from_labeled_rejects_mismatched_tickers() {
+        let mu = DVector::from_vec(vec![0.10, 0.15]);
+        let cov = diag(&[1.0, 4.0]);
+        let lv = LabeledVector::new(mu, vec!["AAPL".into(), "MSFT".into()]).unwrap();
+        let lm = LabeledMatrix::new(cov, vec!["AAPL".into(), "GOOG".into()]).unwrap();
+        assert!(EfficientFrontier::from_labeled(lv, lm).is_err());
+    }
+
+    #[test]
+    fn max_sharpe_labeled_carries_tickers() {
+        let mu = DVector::from_vec(vec![0.10, 0.20]);
+        let cov = diag(&[0.04, 0.16]);
+        let mut ef = EfficientFrontier::new(mu, cov)
+            .unwrap()
+            .with_tickers(vec!["AAPL".into(), "MSFT".into()])
+            .unwrap();
+        let w = ef.max_sharpe_labeled(0.0).unwrap();
+        assert_eq!(w.len(), 2);
+        assert!(w.contains_key("AAPL") && w.contains_key("MSFT"));
     }
 
     #[test]

@@ -17,6 +17,13 @@
 //! All matrix / vector inputs and outputs use [`nalgebra`]'s `DMatrix` /
 //! `DVector` so they slot into broader nalgebra-based pipelines.
 //!
+//! Each estimator and optimiser also has a `_labeled` companion that
+//! accepts ticker names alongside the prices and returns
+//! `BTreeMap<String, f64>` (ordered by ticker), mirroring how
+//! PyPortfolioOpt accepts a `pandas.DataFrame` and returns an
+//! `OrderedDict`. See [`LabeledVector`] / [`LabeledMatrix`] for the
+//! intermediate types.
+//!
 //! Every estimator and optimiser keeps the same default annualisation
 //! convention as PyPortfolioOpt: 252 trading days unless explicitly
 //! overridden by the caller.

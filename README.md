@@ -28,7 +28,7 @@ Every optimiser exposes the same trio of conveniences as PyPortfolioOpt: `portfo
 
 ```toml
 [dependencies]
-rust-portfolio-opt = "0.1"
+rust-portfolio-opt = "0.2"
 nalgebra = "0.33"
 ```
 
@@ -36,32 +36,48 @@ Tested on Rust 1.74+ (edition 2021). Pure Rust — no system BLAS, no Python int
 
 ## Quick start
 
+PyPortfolioOpt takes pandas DataFrames keyed by ticker and returns ticker-keyed
+`Series` / `OrderedDict` objects. This crate offers the same ergonomics through
+a parallel **labeled API**: pass tickers in once, get ticker-keyed maps back.
+The raw `nalgebra`-only API is still available for non-labeled workflows.
+
 ```rust
-use nalgebra::{DMatrix, DVector};
+use nalgebra::DMatrix;
 use rust_portfolio_opt::{
-    expected_returns::{mean_historical_return, ReturnsKind},
-    risk_models::sample_cov,
+    expected_returns::{mean_historical_return_labeled, ReturnsKind},
+    risk_models::sample_cov_labeled,
     efficient_frontier::EfficientFrontier,
 };
 
 // `prices` is a T x N matrix: T daily closes, N tickers, in column order.
 let prices: DMatrix<f64> = /* load your data */;
+let tickers: Vec<String> =
+    ["AAPL", "MSFT", "GOOG", "AMZN"].iter().map(|s| s.to_string()).collect();
 
-// 1. Annualised expected returns — geometric (compounding=true), 252 trading days.
-let mu = mean_historical_return(&prices, ReturnsKind::Simple, true, None)?;
+// 1. Annualised expected returns and sample covariance, both ticker-labeled.
+let mu  = mean_historical_return_labeled(&prices, &tickers, ReturnsKind::Simple, true, None)?;
+let cov = sample_cov_labeled(&prices, &tickers, None)?;
 
-// 2. Annualised sample covariance.
-let cov = sample_cov(&prices, None)?;
-
-// 3. Tangency portfolio with risk-free rate of 2%.
-let mut ef = EfficientFrontier::new(mu, cov)?
+// 2. Tangency portfolio. `from_labeled` consumes the labeled inputs and
+//    remembers the ticker order; `*_labeled` variants return BTreeMaps.
+let mut ef = EfficientFrontier::from_labeled(mu, cov)?
     .with_uniform_bounds(0.0, 1.0); // long-only
-let weights = ef.max_sharpe(0.02)?;
+let weights = ef.max_sharpe_labeled(0.02)?; // BTreeMap<String, f64>
 let (ret, vol, sharpe) = ef.portfolio_performance(0.02)?;
 
-println!("weights: {:.4}", weights);
+for (ticker, w) in &weights {
+    println!("{ticker}: {:.2}%", 100.0 * w);
+}
 println!("E[R] = {:.2}%, vol = {:.2}%, Sharpe = {:.2}", 100.0 * ret, 100.0 * vol, sharpe);
 ```
+
+Every estimator and optimiser ships in two flavours:
+
+- **Raw**: takes / returns `DVector<f64>` / `DMatrix<f64>` — e.g. `mean_historical_return`,
+  `EfficientFrontier::new(...)`, `ef.max_sharpe(rf)`.
+- **Labeled**: takes / returns `LabeledVector` / `LabeledMatrix` / `BTreeMap<String, f64>` —
+  e.g. `mean_historical_return_labeled`, `EfficientFrontier::from_labeled(...)`,
+  `ef.max_sharpe_labeled(rf)`. Weight maps are alphabetically ordered.
 
 ### Black-Litterman
 
@@ -70,16 +86,16 @@ use rust_portfolio_opt::black_litterman::{
     BlackLittermanModel, market_implied_prior_returns,
 };
 
-// Equilibrium prior: pi = delta * Sigma * w_market.
 let pi = market_implied_prior_returns(&market_caps, delta, &cov)?;
 
-// One absolute view: "asset 0 returns 5%". P is 1xN, Q is 1x1.
 let p = DMatrix::from_row_slice(1, n, &[1.0, 0.0, /* ... */]);
 let q = DVector::from_vec(vec![0.05]);
 
-let mut blm = BlackLittermanModel::new(cov.clone(), Some(pi), p, q, None)?;
-let posterior_returns = blm.bl_returns()?;
-let posterior_weights = blm.bl_weights(Some(delta))?;
+let mut blm = BlackLittermanModel::new(cov.clone(), Some(pi), p, q, None)?
+    .with_tickers(tickers.clone())?;
+
+let posterior_returns: BTreeMap<String, f64> = blm.bl_returns_labeled()?.to_map();
+let posterior_weights: BTreeMap<String, f64> = blm.bl_weights_labeled(Some(delta))?;
 ```
 
 ### Hierarchical Risk Parity
@@ -88,19 +104,21 @@ let posterior_weights = blm.bl_weights(Some(delta))?;
 use rust_portfolio_opt::hrp::{HRPOpt, LinkageMethod};
 
 let mut hrp = HRPOpt::from_prices(&prices)?
-    .with_linkage(LinkageMethod::Single);
-let weights = hrp.optimize()?;
+    .with_linkage(LinkageMethod::Single)
+    .with_tickers(tickers.clone())?;
+let weights: BTreeMap<String, f64> = hrp.optimize_labeled()?;
 ```
 
 ### Discrete allocation (130/30 long/short)
 
 ```rust
-use rust_portfolio_opt::discrete_allocation::DiscreteAllocation;
+use std::collections::{BTreeMap, HashMap};
+use rust_portfolio_opt::discrete_allocation::{DiscreteAllocation, get_latest_prices_labeled};
 
-let latest_prices = prices.row(prices.nrows() - 1).transpose();
-let mut da = DiscreteAllocation::new(weights, latest_prices, 100_000.0)?
+let latest = get_latest_prices_labeled(&prices, &tickers)?; // BTreeMap<String, f64>
+let mut da = DiscreteAllocation::new_labeled(weights, latest, 100_000.0)?
     .with_short_ratio(0.30)?;
-let (allocation, leftover) = da.greedy_portfolio()?;
+let (allocation, leftover): (HashMap<String, i64>, f64) = da.greedy_portfolio_labeled()?;
 ```
 
 ## Validation

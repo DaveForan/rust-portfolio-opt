@@ -1,9 +1,124 @@
 //! Internal helpers shared across modules. Re-exported from the crate root
 //! for downstream convenience.
 
+use std::collections::BTreeMap;
+
 use nalgebra::{DMatrix, DVector};
 
 use crate::{PortfolioError, Result};
+
+/// A length-N vector of floats paired with N ticker labels. Mirrors a
+/// pandas `Series` indexed by ticker name. Returned by every estimator
+/// that has a `_labeled` companion (e.g.
+/// [`crate::expected_returns::mean_historical_return_labeled`]) so callers
+/// can keep ticker order alongside the numerical values.
+#[derive(Debug, Clone)]
+pub struct LabeledVector {
+    pub values: DVector<f64>,
+    pub tickers: Vec<String>,
+}
+
+impl LabeledVector {
+    pub fn new(values: DVector<f64>, tickers: Vec<String>) -> Result<Self> {
+        if values.len() != tickers.len() {
+            return Err(PortfolioError::DimensionMismatch(format!(
+                "LabeledVector: values len {} ≠ tickers len {}",
+                values.len(),
+                tickers.len()
+            )));
+        }
+        Ok(Self { values, tickers })
+    }
+
+    /// Look up a single value by ticker name.
+    pub fn get(&self, ticker: &str) -> Option<f64> {
+        self.tickers
+            .iter()
+            .position(|t| t == ticker)
+            .map(|i| self.values[i])
+    }
+
+    /// Convert to a `BTreeMap<String, f64>` ordered alphabetically by
+    /// ticker, matching PyPortfolioOpt's `OrderedDict` style output.
+    pub fn to_map(&self) -> BTreeMap<String, f64> {
+        self.tickers
+            .iter()
+            .zip(self.values.iter())
+            .map(|(t, v)| (t.clone(), *v))
+            .collect()
+    }
+}
+
+/// A square N×N matrix paired with N ticker labels (used for both row
+/// and column indexing — the same labelling pandas applies to a
+/// covariance/correlation `DataFrame`).
+#[derive(Debug, Clone)]
+pub struct LabeledMatrix {
+    pub values: DMatrix<f64>,
+    pub tickers: Vec<String>,
+}
+
+impl LabeledMatrix {
+    pub fn new(values: DMatrix<f64>, tickers: Vec<String>) -> Result<Self> {
+        let (r, c) = values.shape();
+        if r != c {
+            return Err(PortfolioError::DimensionMismatch(format!(
+                "LabeledMatrix: expected square matrix, got {r}x{c}"
+            )));
+        }
+        if r != tickers.len() {
+            return Err(PortfolioError::DimensionMismatch(format!(
+                "LabeledMatrix: matrix is {r}x{r} but tickers len is {}",
+                tickers.len()
+            )));
+        }
+        Ok(Self { values, tickers })
+    }
+
+    /// Look up `[row_ticker, col_ticker]`.
+    pub fn get(&self, row_ticker: &str, col_ticker: &str) -> Option<f64> {
+        let r = self.tickers.iter().position(|t| t == row_ticker)?;
+        let c = self.tickers.iter().position(|t| t == col_ticker)?;
+        Some(self.values[(r, c)])
+    }
+}
+
+/// Convert a `(values, tickers)` pair into a ticker-keyed `BTreeMap`,
+/// matching PyPortfolioOpt's habit of returning weights as an
+/// `OrderedDict[str, float]`. Errors if the lengths disagree.
+pub fn to_weight_map(values: &DVector<f64>, tickers: &[String]) -> Result<BTreeMap<String, f64>> {
+    if values.len() != tickers.len() {
+        return Err(PortfolioError::DimensionMismatch(format!(
+            "to_weight_map: values len {} ≠ tickers len {}",
+            values.len(),
+            tickers.len()
+        )));
+    }
+    Ok(tickers
+        .iter()
+        .zip(values.iter())
+        .map(|(t, v)| (t.clone(), *v))
+        .collect())
+}
+
+/// Validate that two ticker label vectors agree in length and order.
+pub(crate) fn assert_tickers_match(a: &[String], b: &[String], label: &str) -> Result<()> {
+    if a.len() != b.len() {
+        return Err(PortfolioError::DimensionMismatch(format!(
+            "{label}: ticker counts disagree ({} vs {})",
+            a.len(),
+            b.len()
+        )));
+    }
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        if x != y {
+            return Err(PortfolioError::InvalidArgument(format!(
+                "{label}: ticker mismatch at position {i}: '{x}' vs '{y}'"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Compute simple period-over-period returns from a `T x N` price matrix.
 ///

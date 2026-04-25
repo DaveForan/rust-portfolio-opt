@@ -12,9 +12,13 @@
 //! ("asset *i* will outperform asset *j* by *q*") are expressed by
 //! filling in rows of the picking matrix `P`.
 
+use std::collections::BTreeMap;
+
 use nalgebra::{DMatrix, DVector};
 
-use crate::prelude::{assert_square, returns_from_prices};
+use crate::prelude::{
+    assert_square, returns_from_prices, to_weight_map, LabeledMatrix, LabeledVector,
+};
 use crate::{PortfolioError, Result, TRADING_DAYS_PER_YEAR};
 
 /// Recover the implied excess returns under market equilibrium.
@@ -108,6 +112,9 @@ pub struct BlackLittermanModel {
     /// Risk aversion δ used by [`Self::bl_weights`] when no override is
     /// supplied. Defaults to 1.0; mirrors PyPortfolioOpt's default.
     pub risk_aversion: f64,
+    /// Optional ticker labels (one per asset). Required by `_labeled`
+    /// companions.
+    pub tickers: Option<Vec<String>>,
     /// Cached posterior weights from the most recent `bl_weights` call.
     pub weights: Option<DVector<f64>>,
 }
@@ -176,6 +183,7 @@ impl BlackLittermanModel {
             omega_diag,
             tau,
             risk_aversion: 1.0,
+            tickers: None,
             weights: None,
         })
     }
@@ -184,6 +192,63 @@ impl BlackLittermanModel {
     pub fn with_risk_aversion(mut self, delta: f64) -> Self {
         self.risk_aversion = delta;
         self
+    }
+
+    /// Attach ticker labels to the model. Length must equal the number
+    /// of assets in `cov`.
+    pub fn with_tickers(mut self, tickers: Vec<String>) -> Result<Self> {
+        if tickers.len() != self.cov.nrows() {
+            return Err(PortfolioError::DimensionMismatch(format!(
+                "with_tickers: {} tickers but {} assets",
+                tickers.len(),
+                self.cov.nrows()
+            )));
+        }
+        self.tickers = Some(tickers);
+        Ok(self)
+    }
+
+    fn require_tickers(&self, label: &str) -> Result<&Vec<String>> {
+        self.tickers.as_ref().ok_or_else(|| {
+            PortfolioError::InvalidArgument(format!(
+                "{label}: no tickers attached — call with_tickers first"
+            ))
+        })
+    }
+
+    /// Ticker-keyed posterior expected returns.
+    pub fn bl_returns_labeled(&self) -> Result<LabeledVector> {
+        let mu = self.bl_returns()?;
+        let tickers = self.require_tickers("bl_returns_labeled")?;
+        LabeledVector::new(mu, tickers.clone())
+    }
+
+    /// Ticker-labeled posterior covariance (square `LabeledMatrix`).
+    pub fn bl_cov_labeled(&self) -> Result<LabeledMatrix> {
+        let cov = self.bl_cov()?;
+        let tickers = self.require_tickers("bl_cov_labeled")?;
+        LabeledMatrix::new(cov, tickers.clone())
+    }
+
+    /// Ticker-keyed posterior weights.
+    pub fn bl_weights_labeled(
+        &mut self,
+        risk_aversion: Option<f64>,
+    ) -> Result<BTreeMap<String, f64>> {
+        let w = self.bl_weights(risk_aversion)?;
+        let tickers = self.require_tickers("bl_weights_labeled")?;
+        to_weight_map(&w, tickers)
+    }
+
+    /// Ticker-keyed cleaned weights.
+    pub fn clean_weights_labeled(
+        &self,
+        cutoff: f64,
+        rounding: Option<u32>,
+    ) -> Result<BTreeMap<String, f64>> {
+        let w = self.clean_weights(cutoff, rounding)?;
+        let tickers = self.require_tickers("clean_weights_labeled")?;
+        to_weight_map(&w, tickers)
     }
 
     /// Idzorek's confidence-based view uncertainty. Given per-view
@@ -540,6 +605,35 @@ mod tests {
         let zero = DVector::from_vec(vec![0.0]);
         let omega_zero = BlackLittermanModel::idzorek_omega(&zero, &cov, &p, 0.05).unwrap();
         assert!(omega_zero[0] >= 1e6);
+    }
+
+    #[test]
+    fn bl_labeled_methods_return_ticker_keyed() {
+        let cov = cov_3();
+        let pi = DVector::from_vec(vec![0.05, 0.07, 0.12]);
+        let row = absolute_view(3, 0).unwrap();
+        let p = DMatrix::from_rows(&[row.transpose()]);
+        let q = DVector::from_vec(vec![0.20]);
+        let mut bl = BlackLittermanModel::new(cov, pi, p, q, None, 0.05)
+            .unwrap()
+            .with_tickers(vec!["AAPL".into(), "MSFT".into(), "TSLA".into()])
+            .unwrap();
+        let mu = bl.bl_returns_labeled().unwrap();
+        assert_eq!(mu.tickers.len(), 3);
+        let w = bl.bl_weights_labeled(Some(2.0)).unwrap();
+        assert_eq!(w.len(), 3);
+        assert!(w.contains_key("AAPL"));
+    }
+
+    #[test]
+    fn bl_labeled_errors_without_tickers() {
+        let cov = cov_3();
+        let pi = DVector::from_vec(vec![0.05, 0.07, 0.12]);
+        let p = DMatrix::<f64>::zeros(0, 3);
+        let q = DVector::<f64>::zeros(0);
+        let omega = Some(DVector::<f64>::zeros(0));
+        let bl = BlackLittermanModel::new(cov, pi, p, q, omega, 0.05).unwrap();
+        assert!(bl.bl_returns_labeled().is_err());
     }
 
     #[test]

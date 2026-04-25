@@ -27,9 +27,13 @@
 //! The frontier runs from λ → +∞ (maximum-return portfolio) down to λ = 0
 //! (minimum-variance portfolio).
 
+use std::collections::BTreeMap;
+
 use nalgebra::{DMatrix, DVector};
 
-use crate::prelude::assert_square;
+use crate::prelude::{
+    assert_square, assert_tickers_match, to_weight_map, LabeledMatrix, LabeledVector,
+};
 use crate::{PortfolioError, Result};
 
 // ---------------------------------------------------------------------------
@@ -44,6 +48,9 @@ pub struct CLA {
     pub lb: DVector<f64>,
     /// Per-asset upper bounds (default 1).
     pub ub: DVector<f64>,
+    /// Optional ticker labels (one per asset). Required by `_labeled`
+    /// companion methods.
+    pub tickers: Option<Vec<String>>,
     n: usize,
     /// Corner portfolios ordered from high-λ (high return) to low-λ (min var).
     corner_weights: Vec<DVector<f64>>,
@@ -72,10 +79,42 @@ impl CLA {
             sigma,
             lb: DVector::zeros(n),
             ub: DVector::from_element(n, 1.0),
+            tickers: None,
             n,
             corner_weights: Vec::new(),
             corner_lambdas: Vec::new(),
             weights: None,
+        })
+    }
+
+    /// Build a CLA from labeled inputs. Ticker vectors on `mu` and
+    /// `sigma` must agree.
+    pub fn from_labeled(mu: LabeledVector, sigma: LabeledMatrix) -> Result<Self> {
+        assert_tickers_match(&mu.tickers, &sigma.tickers, "CLA::from_labeled")?;
+        let tickers = mu.tickers.clone();
+        let mut cla = Self::new(mu.values, sigma.values)?;
+        cla.tickers = Some(tickers);
+        Ok(cla)
+    }
+
+    /// Attach ticker labels.
+    pub fn with_tickers(mut self, tickers: Vec<String>) -> Result<Self> {
+        if tickers.len() != self.n {
+            return Err(PortfolioError::DimensionMismatch(format!(
+                "with_tickers: {} tickers but {} assets",
+                tickers.len(),
+                self.n
+            )));
+        }
+        self.tickers = Some(tickers);
+        Ok(self)
+    }
+
+    fn require_tickers(&self, label: &str) -> Result<&Vec<String>> {
+        self.tickers.as_ref().ok_or_else(|| {
+            PortfolioError::InvalidArgument(format!(
+                "{label}: no tickers attached — call with_tickers or from_labeled first"
+            ))
         })
     }
 
@@ -230,6 +269,35 @@ impl CLA {
             )
         })?;
         Ok(crate::prelude::clean_weights(w, cutoff, rounding))
+    }
+
+    // -----------------------------------------------------------------------
+    // Labeled (ticker-keyed) companions
+    // -----------------------------------------------------------------------
+
+    /// Ticker-keyed minimum-variance weights.
+    pub fn min_vol_labeled(&mut self) -> Result<BTreeMap<String, f64>> {
+        let w = self.min_vol()?;
+        let tickers = self.require_tickers("min_vol_labeled")?;
+        to_weight_map(&w, tickers)
+    }
+
+    /// Ticker-keyed tangency weights.
+    pub fn max_sharpe_labeled(&mut self, risk_free_rate: f64) -> Result<BTreeMap<String, f64>> {
+        let w = self.max_sharpe(risk_free_rate)?;
+        let tickers = self.require_tickers("max_sharpe_labeled")?;
+        to_weight_map(&w, tickers)
+    }
+
+    /// Ticker-keyed cleaned weights.
+    pub fn clean_weights_labeled(
+        &self,
+        cutoff: f64,
+        rounding: Option<u32>,
+    ) -> Result<BTreeMap<String, f64>> {
+        let w = self.clean_weights(cutoff, rounding)?;
+        let tickers = self.require_tickers("clean_weights_labeled")?;
+        to_weight_map(&w, tickers)
     }
 
     // -----------------------------------------------------------------------
@@ -828,5 +896,24 @@ mod tests {
         let mut cla = two_asset_setup();
         cla.ensure_frontier().unwrap();
         assert!(!cla.corner_weights.is_empty());
+    }
+
+    #[test]
+    fn min_vol_labeled_returns_ticker_keyed_weights() {
+        let mu = DVector::from_vec(vec![0.10, 0.15]);
+        let cov = diag(&[0.01, 0.04]);
+        let lv = LabeledVector::new(mu, vec!["AAPL".into(), "MSFT".into()]).unwrap();
+        let lm = LabeledMatrix::new(cov, vec!["AAPL".into(), "MSFT".into()]).unwrap();
+        let mut cla = CLA::from_labeled(lv, lm).unwrap();
+        let w = cla.min_vol_labeled().unwrap();
+        assert!(w.contains_key("AAPL") && w.contains_key("MSFT"));
+        let total: f64 = w.values().sum();
+        assert_relative_eq!(total, 1.0, epsilon = 1e-2);
+    }
+
+    #[test]
+    fn cla_labeled_methods_error_without_tickers() {
+        let mut cla = two_asset_setup();
+        assert!(cla.min_vol_labeled().is_err());
     }
 }

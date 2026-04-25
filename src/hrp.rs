@@ -10,9 +10,11 @@
 //! 4. Recursively bisect the ordered set, distributing risk inversely
 //!    to each side's volatility ("recursive bisection").
 
+use std::collections::BTreeMap;
+
 use nalgebra::{DMatrix, DVector};
 
-use crate::prelude::{returns_from_prices, sample_covariance};
+use crate::prelude::{returns_from_prices, sample_covariance, to_weight_map, LabeledMatrix};
 use crate::risk_models::cov_to_corr;
 use crate::{PortfolioError, Result};
 
@@ -36,6 +38,9 @@ pub struct HRPOpt {
     /// Override for the covariance matrix (set by `from_cov_matrix`).
     pub cov_override: Option<DMatrix<f64>>,
     pub linkage: LinkageMethod,
+    /// Optional ticker labels (one per asset). Required by every
+    /// `_labeled` companion.
+    pub tickers: Option<Vec<String>>,
     pub weights: Option<DVector<f64>>,
 }
 
@@ -50,6 +55,7 @@ impl HRPOpt {
             returns,
             cov_override: None,
             linkage: LinkageMethod::default(),
+            tickers: None,
             weights: None,
         })
     }
@@ -71,6 +77,7 @@ impl HRPOpt {
             returns: DMatrix::<f64>::zeros(0, cov.nrows()),
             cov_override: Some(cov),
             linkage: LinkageMethod::default(),
+            tickers: None,
             weights: None,
         })
     }
@@ -79,6 +86,60 @@ impl HRPOpt {
     pub fn with_linkage(mut self, method: LinkageMethod) -> Self {
         self.linkage = method;
         self
+    }
+
+    /// Build an HRP optimiser directly from a labeled covariance matrix.
+    /// The ticker labels are remembered for use by every `_labeled`
+    /// accessor.
+    pub fn from_labeled_cov(cov: LabeledMatrix) -> Result<Self> {
+        let mut hrp = Self::from_cov_matrix(cov.values)?;
+        hrp.tickers = Some(cov.tickers);
+        Ok(hrp)
+    }
+
+    /// Attach ticker labels to an existing optimiser. Length must match
+    /// the number of assets.
+    pub fn with_tickers(mut self, tickers: Vec<String>) -> Result<Self> {
+        let n = self
+            .cov_override
+            .as_ref()
+            .map(|m| m.nrows())
+            .unwrap_or(self.returns.ncols());
+        if tickers.len() != n {
+            return Err(PortfolioError::DimensionMismatch(format!(
+                "with_tickers: {} tickers but {n} assets",
+                tickers.len()
+            )));
+        }
+        self.tickers = Some(tickers);
+        Ok(self)
+    }
+
+    fn require_tickers(&self, label: &str) -> Result<&Vec<String>> {
+        self.tickers.as_ref().ok_or_else(|| {
+            PortfolioError::InvalidArgument(format!(
+                "{label}: no tickers attached — call with_tickers or from_labeled_cov first"
+            ))
+        })
+    }
+
+    /// Ticker-keyed HRP weights. Mirrors PyPortfolioOpt's `HRPOpt.optimize()`
+    /// returning an `OrderedDict[ticker, weight]`.
+    pub fn optimize_labeled(&mut self) -> Result<BTreeMap<String, f64>> {
+        let w = self.optimize()?;
+        let tickers = self.require_tickers("optimize_labeled")?;
+        to_weight_map(&w, tickers)
+    }
+
+    /// Ticker-keyed cleaned weights.
+    pub fn clean_weights_labeled(
+        &self,
+        cutoff: f64,
+        rounding: Option<u32>,
+    ) -> Result<BTreeMap<String, f64>> {
+        let w = self.clean_weights(cutoff, rounding)?;
+        let tickers = self.require_tickers("clean_weights_labeled")?;
+        to_weight_map(&w, tickers)
     }
 
     fn cov(&self) -> Result<DMatrix<f64>> {
@@ -402,6 +463,35 @@ mod tests {
         let mut hrp = HRPOpt::from_cov_matrix(cov).unwrap();
         let w = hrp.optimize().unwrap();
         let total: f64 = w.iter().sum();
+        assert_relative_eq!(total, 1.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn optimize_labeled_returns_ticker_keyed_weights() {
+        let r = synthetic_returns();
+        let tickers: Vec<String> = (0..5).map(|i| format!("T{i}")).collect();
+        let mut hrp = HRPOpt::from_returns(r)
+            .unwrap()
+            .with_tickers(tickers.clone())
+            .unwrap();
+        let w = hrp.optimize_labeled().unwrap();
+        assert_eq!(w.len(), 5);
+        for t in &tickers {
+            assert!(w.contains_key(t));
+        }
+        let total: f64 = w.values().sum();
+        assert_relative_eq!(total, 1.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn from_labeled_cov_round_trips() {
+        let r = synthetic_returns();
+        let cov = sample_covariance(&r).unwrap();
+        let tickers: Vec<String> = (0..5).map(|i| format!("T{i}")).collect();
+        let lm = LabeledMatrix::new(cov, tickers.clone()).unwrap();
+        let mut hrp = HRPOpt::from_labeled_cov(lm).unwrap();
+        let w = hrp.optimize_labeled().unwrap();
+        let total: f64 = w.values().sum();
         assert_relative_eq!(total, 1.0, epsilon = 1e-9);
     }
 

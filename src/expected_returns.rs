@@ -4,9 +4,11 @@
 //! matrix (`T x N`, rows = dates oldest→newest, columns = assets) and
 //! returns an annualised mean-return vector of length `N`.
 
+use std::collections::BTreeMap;
+
 use nalgebra::{DMatrix, DVector};
 
-use crate::prelude::{column_means, log_returns_from_prices, returns_from_prices};
+use crate::prelude::{column_means, log_returns_from_prices, returns_from_prices, LabeledVector};
 use crate::{PortfolioError, Result, TRADING_DAYS_PER_YEAR};
 
 /// Whether to compute simple or log returns under the hood.
@@ -181,6 +183,97 @@ pub fn capm_return(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Labeled (ticker-aware) wrappers — match PyPortfolioOpt's DataFrame I/O
+// ---------------------------------------------------------------------------
+
+fn validate_labels(prices: &DMatrix<f64>, tickers: &[String]) -> Result<()> {
+    if prices.ncols() != tickers.len() {
+        return Err(PortfolioError::DimensionMismatch(format!(
+            "prices has {} columns but {} tickers were supplied",
+            prices.ncols(),
+            tickers.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Ticker-labeled version of [`mean_historical_return`]. Returns a
+/// [`LabeledVector`] you can convert to `BTreeMap<String, f64>` via
+/// [`LabeledVector::to_map`] when you need an ordered, ticker-keyed
+/// output.
+pub fn mean_historical_return_labeled(
+    prices: &DMatrix<f64>,
+    tickers: &[String],
+    kind: ReturnsKind,
+    compounding: bool,
+    frequency: Option<usize>,
+) -> Result<LabeledVector> {
+    validate_labels(prices, tickers)?;
+    let mu = mean_historical_return(prices, kind, compounding, frequency)?;
+    LabeledVector::new(mu, tickers.to_vec())
+}
+
+/// Ticker-labeled version of [`ema_historical_return`].
+pub fn ema_historical_return_labeled(
+    prices: &DMatrix<f64>,
+    tickers: &[String],
+    kind: ReturnsKind,
+    compounding: bool,
+    span: usize,
+    frequency: Option<usize>,
+) -> Result<LabeledVector> {
+    validate_labels(prices, tickers)?;
+    let mu = ema_historical_return(prices, kind, compounding, span, frequency)?;
+    LabeledVector::new(mu, tickers.to_vec())
+}
+
+/// Ticker-labeled version of [`capm_return`]. The returned labels exclude
+/// the market column at `market_idx`.
+pub fn capm_return_labeled(
+    prices: &DMatrix<f64>,
+    tickers: &[String],
+    kind: ReturnsKind,
+    market_idx: usize,
+    risk_free_rate: f64,
+    frequency: Option<usize>,
+) -> Result<LabeledVector> {
+    validate_labels(prices, tickers)?;
+    if market_idx >= tickers.len() {
+        return Err(PortfolioError::InvalidArgument(format!(
+            "market_idx {market_idx} out of range for {} tickers",
+            tickers.len()
+        )));
+    }
+    let mu = capm_return(prices, kind, market_idx, risk_free_rate, frequency)?;
+    let asset_tickers: Vec<String> = tickers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            if i == market_idx {
+                None
+            } else {
+                Some(t.clone())
+            }
+        })
+        .collect();
+    LabeledVector::new(mu, asset_tickers)
+}
+
+/// Convenience: run [`mean_historical_return_labeled`] and immediately
+/// convert to a `BTreeMap`. Mirrors PyPortfolioOpt's
+/// `expected_returns.mean_historical_return(prices_df)` returning a
+/// pandas Series.
+pub fn mean_historical_return_map(
+    prices: &DMatrix<f64>,
+    tickers: &[String],
+    kind: ReturnsKind,
+    compounding: bool,
+    frequency: Option<usize>,
+) -> Result<BTreeMap<String, f64>> {
+    Ok(mean_historical_return_labeled(prices, tickers, kind, compounding, frequency)?.to_map())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,5 +368,46 @@ mod tests {
         let p = linear_prices();
         let err = capm_return(&p, ReturnsKind::Simple, 99, 0.0, None).unwrap_err();
         matches!(err, PortfolioError::InvalidArgument(_));
+    }
+
+    #[test]
+    fn mean_historical_return_labeled_carries_tickers() {
+        let p = linear_prices();
+        let tickers = vec!["AAPL".to_string(), "MSFT".to_string()];
+        let lr =
+            mean_historical_return_labeled(&p, &tickers, ReturnsKind::Simple, false, Some(252))
+                .unwrap();
+        assert_eq!(lr.tickers, tickers);
+        assert_relative_eq!(lr.get("AAPL").unwrap(), 0.01 * 252.0, max_relative = 1e-9);
+        let map = lr.to_map();
+        assert!(map.contains_key("AAPL") && map.contains_key("MSFT"));
+    }
+
+    #[test]
+    fn capm_return_labeled_drops_market_ticker() {
+        let prices = dmatrix![
+            100.0, 100.0;
+            101.0,  99.0;
+            100.0, 101.0;
+            101.0,  99.0;
+            100.0, 101.0;
+            101.0,  99.0;
+            100.0, 101.0;
+            101.0,  99.0
+        ];
+        let tickers = vec!["AAPL".to_string(), "SPY".to_string()];
+        let lr =
+            capm_return_labeled(&prices, &tickers, ReturnsKind::Simple, 1, 0.02, Some(1)).unwrap();
+        assert_eq!(lr.tickers, vec!["AAPL".to_string()]);
+        assert_eq!(lr.values.len(), 1);
+    }
+
+    #[test]
+    fn labeled_rejects_mismatched_tickers() {
+        let p = linear_prices();
+        let tickers = vec!["AAPL".to_string()]; // wrong length
+        assert!(
+            mean_historical_return_labeled(&p, &tickers, ReturnsKind::Simple, false, None).is_err()
+        );
     }
 }
