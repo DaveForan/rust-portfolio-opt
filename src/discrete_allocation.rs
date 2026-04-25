@@ -299,7 +299,10 @@ mod tests {
         let budget = 10_000.0;
         let da = DiscreteAllocation::new(weights, prices, budget).unwrap();
         let (alloc, leftover) = da.greedy_portfolio().unwrap();
-        assert!(leftover >= -1e-9, "leftover should be non-negative, got {leftover}");
+        assert!(
+            leftover >= -1e-9,
+            "leftover should be non-negative, got {leftover}"
+        );
         let spent = da.allocation_value(&alloc);
         assert!(
             spent <= budget + 1e-9,

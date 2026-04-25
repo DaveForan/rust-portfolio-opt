@@ -3,17 +3,16 @@
 //! The crate mirrors PyPortfolioOpt's module structure:
 //!
 //! - [`expected_returns`] — historical mean / EMA / CAPM return estimators.
-//! - [`risk_models`]      — sample / EWMA / semi-covariance + Ledoit-Wolf and
-//!                          oracle-approximating shrinkage; cov ↔ corr helpers.
+//! - [`risk_models`] — sample / EWMA / semi-covariance + Ledoit-Wolf and
+//!   oracle-approximating shrinkage; cov ↔ corr helpers.
 //! - [`efficient_frontier`] — mean-variance optimisation: minimum variance,
-//!                            tangency (max Sharpe), efficient risk / return,
-//!                            with weight bounds.
-//! - [`black_litterman`]  — equilibrium prior + view-blended posterior.
-//! - [`hrp`]              — hierarchical risk parity (correlation distance,
-//!                          single linkage, recursive bisection).
-//! - [`cla`]              — Markowitz's Critical Line Algorithm.
+//!   tangency (max Sharpe), efficient risk / return, with weight bounds.
+//! - [`black_litterman`] — equilibrium prior + view-blended posterior.
+//! - [`hrp`] — hierarchical risk parity (correlation distance, single
+//!   linkage, recursive bisection).
+//! - [`cla`] — Markowitz's Critical Line Algorithm.
 //! - [`discrete_allocation`] — convert continuous weights to integer share
-//!                              counts under a budget.
+//!   counts under a budget.
 //!
 //! All matrix / vector inputs and outputs use [`nalgebra`]'s `DMatrix` /
 //! `DVector` so they slot into broader nalgebra-based pipelines.

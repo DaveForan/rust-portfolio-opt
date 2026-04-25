@@ -89,11 +89,7 @@ pub fn market_implied_risk_aversion_from_prices(
     }
     let f = frequency.unwrap_or(TRADING_DAYS_PER_YEAR) as f64;
     let mean: f64 = returns.iter().sum::<f64>() / t as f64;
-    let var: f64 = returns
-        .iter()
-        .map(|r| (r - mean).powi(2))
-        .sum::<f64>()
-        / (t as f64 - 1.0);
+    let var: f64 = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (t as f64 - 1.0);
     market_implied_risk_aversion(mean * f - risk_free_rate, var * f)
 }
 
@@ -311,7 +307,11 @@ impl BlackLittermanModel {
         let ret = mu.dot(w);
         let var = (w.transpose() * &self.cov * w)[(0, 0)];
         let vol = var.max(0.0).sqrt();
-        let sharpe = if vol > 0.0 { (ret - risk_free_rate) / vol } else { 0.0 };
+        let sharpe = if vol > 0.0 {
+            (ret - risk_free_rate) / vol
+        } else {
+            0.0
+        };
         Ok((ret, vol, sharpe))
     }
 
@@ -394,11 +394,7 @@ mod tests {
         DMatrix::from_row_slice(
             3,
             3,
-            &[
-                0.04, 0.01, 0.005,
-                0.01, 0.09, 0.02,
-                0.005, 0.02, 0.16,
-            ],
+            &[0.04, 0.01, 0.005, 0.01, 0.09, 0.02, 0.005, 0.02, 0.16],
         )
     }
 

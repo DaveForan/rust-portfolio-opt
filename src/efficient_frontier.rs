@@ -96,7 +96,11 @@ impl EfficientFrontier {
     }
 
     fn budget_target(&self) -> f64 {
-        if self.market_neutral { 0.0 } else { 1.0 }
+        if self.market_neutral {
+            0.0
+        } else {
+            1.0
+        }
     }
 
     pub fn with_bounds(mut self, bounds: Vec<WeightBound>) -> Result<Self> {
@@ -178,10 +182,11 @@ impl EfficientFrontier {
         }
         let q = -self.expected_returns.clone();
         let a = DMatrix::from_row_slice(1, n, &vec![1.0_f64; n]);
-        let target = market_neutral
-            .unwrap_or(self.market_neutral)
-            .then_some(0.0)
-            .unwrap_or(1.0);
+        let target = if market_neutral.unwrap_or(self.market_neutral) {
+            0.0
+        } else {
+            1.0
+        };
         let b = DVector::from_vec(vec![target]);
         let (lb, ub) = self.lb_ub();
         let prob = QpProblem::new(p, q, a, b, lb, ub)?;
@@ -353,7 +358,11 @@ impl EfficientFrontier {
         let ret = self.expected_returns.dot(w);
         let var = (w.transpose() * &self.cov * w)[(0, 0)];
         let vol = var.max(0.0).sqrt();
-        let sharpe = if vol > 0.0 { (ret - risk_free_rate) / vol } else { 0.0 };
+        let sharpe = if vol > 0.0 {
+            (ret - risk_free_rate) / vol
+        } else {
+            0.0
+        };
         Ok((ret, vol, sharpe))
     }
 

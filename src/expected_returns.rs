@@ -10,16 +10,11 @@ use crate::prelude::{column_means, log_returns_from_prices, returns_from_prices}
 use crate::{PortfolioError, Result, TRADING_DAYS_PER_YEAR};
 
 /// Whether to compute simple or log returns under the hood.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReturnsKind {
+    #[default]
     Simple,
     Log,
-}
-
-impl Default for ReturnsKind {
-    fn default() -> Self {
-        ReturnsKind::Simple
-    }
 }
 
 fn build_returns(prices: &DMatrix<f64>, kind: ReturnsKind) -> Result<DMatrix<f64>> {
@@ -155,11 +150,8 @@ pub fn capm_return(
     let f = frequency.unwrap_or(TRADING_DAYS_PER_YEAR) as f64;
     let mkt = returns.column(market_idx).clone_owned();
     let mkt_mean = mkt.mean();
-    let mkt_var: f64 = mkt
-        .iter()
-        .map(|x| (x - mkt_mean).powi(2))
-        .sum::<f64>()
-        / (rows as f64 - 1.0);
+    let mkt_var: f64 =
+        mkt.iter().map(|x| (x - mkt_mean).powi(2)).sum::<f64>() / (rows as f64 - 1.0);
     if mkt_var <= 0.0 {
         return Err(PortfolioError::InvalidArgument(
             "market variance is zero or negative".into(),

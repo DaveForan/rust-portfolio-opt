@@ -26,31 +26,33 @@ fn returns_with_kind(prices: &DMatrix<f64>, kind: ReturnsKind) -> Result<DMatrix
 pub const DEFAULT_SEMICOV_BENCHMARK: f64 = 0.000079;
 
 /// How to repair a covariance matrix that has negative eigenvalues.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum FixMethod {
     /// Spectral repair: clip negative eigenvalues to zero and rebuild.
+    #[default]
     Spectral,
     /// Diagonal load: shift the diagonal by `1.1 * |min_eig|`.
     Diag,
 }
 
-impl Default for FixMethod {
-    fn default() -> Self {
-        FixMethod::Spectral
-    }
-}
-
 /// Repair a covariance matrix so it is positive semi-definite. Mirrors
 /// `pypfopt.risk_models.fix_nonpositive_semidefinite`. If `matrix` is
 /// already PSD (eigenvalues `≥ -1e-12`) it is returned unchanged.
-pub fn fix_nonpositive_semidefinite(matrix: &DMatrix<f64>, method: FixMethod) -> Result<DMatrix<f64>> {
+pub fn fix_nonpositive_semidefinite(
+    matrix: &DMatrix<f64>,
+    method: FixMethod,
+) -> Result<DMatrix<f64>> {
     let n = crate::prelude::assert_square(matrix, "fix_nonpositive_semidefinite")?;
     // Symmetrise before decomposing — small asymmetries can flip
     // eigenvalues, which matters when we're trying to detect non-PSDness.
     let mut sym = matrix.clone();
     symmetrise(&mut sym);
     let eig = SymmetricEigen::new(sym.clone());
-    let min_eig = eig.eigenvalues.iter().cloned().fold(f64::INFINITY, f64::min);
+    let min_eig = eig
+        .eigenvalues
+        .iter()
+        .cloned()
+        .fold(f64::INFINITY, f64::min);
     if min_eig >= -1e-12 {
         return Ok(sym);
     }
@@ -309,10 +311,11 @@ pub fn risk_matrix(
 
 /// Choice of shrinkage target for [`CovarianceShrinkage::ledoit_wolf`].
 /// Mirrors PyPortfolioOpt's `shrinkage_target` argument.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum LedoitWolfTarget {
     /// Identity scaled by the average sample variance — sklearn's default
     /// and PyPortfolioOpt's default.
+    #[default]
     ConstantVariance,
     /// One-factor model: target is `β β^T / σ²_m` with the diagonal
     /// replaced by the sample variances. The "factor" is the equal-
@@ -321,12 +324,6 @@ pub enum LedoitWolfTarget {
     /// Constant-correlation target: average pairwise correlation blended
     /// with the original variances. Ledoit & Wolf (2003).
     ConstantCorrelation,
-}
-
-impl Default for LedoitWolfTarget {
-    fn default() -> Self {
-        LedoitWolfTarget::ConstantVariance
-    }
 }
 
 /// Shrinkage estimators that pull a sample covariance toward a structured
@@ -344,11 +341,7 @@ pub struct CovarianceShrinkage {
 impl CovarianceShrinkage {
     /// Construct from a price matrix. `kind` selects simple vs log
     /// returns (matches PyPortfolioOpt's `log_returns` flag).
-    pub fn new(
-        prices: &DMatrix<f64>,
-        kind: ReturnsKind,
-        frequency: Option<usize>,
-    ) -> Result<Self> {
+    pub fn new(prices: &DMatrix<f64>, kind: ReturnsKind, frequency: Option<usize>) -> Result<Self> {
         let returns = returns_with_kind(prices, kind)?;
         Ok(Self {
             returns,
@@ -396,7 +389,11 @@ impl CovarianceShrinkage {
                 }
             }
         }
-        let avg_corr = if count > 0 { sum_corr / count as f64 } else { 0.0 };
+        let avg_corr = if count > 0 {
+            sum_corr / count as f64
+        } else {
+            0.0
+        };
         let mut target = DMatrix::<f64>::zeros(n, n);
         for i in 0..n {
             for j in 0..n {
@@ -412,7 +409,12 @@ impl CovarianceShrinkage {
 
     /// Apply a fixed shrinkage intensity `delta` toward the
     /// constant-correlation target. Used internally by the named methods.
-    fn shrink_toward(&self, sample: &DMatrix<f64>, target: &DMatrix<f64>, delta: f64) -> DMatrix<f64> {
+    fn shrink_toward(
+        &self,
+        sample: &DMatrix<f64>,
+        target: &DMatrix<f64>,
+        delta: f64,
+    ) -> DMatrix<f64> {
         let mut shrunk = (1.0 - delta) * sample + delta * target;
         symmetrise(&mut shrunk);
         shrunk
@@ -513,7 +515,11 @@ impl CovarianceShrinkage {
         let beta_bar_sq = sum_x4 / (tt * tt) - s_frob_sq / tt;
         // β² is bounded by δ² to keep shrinkage in [0, 1].
         let beta_sq = beta_bar_sq.min(delta_sq);
-        let delta = if delta_sq > 0.0 { (beta_sq / delta_sq).clamp(0.0, 1.0) } else { 0.0 };
+        let delta = if delta_sq > 0.0 {
+            (beta_sq / delta_sq).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let target = DMatrix::<f64>::identity(n, n) * mu;
         let shrunk = self.shrink_toward(&s, &target, delta);
         self.delta = delta;
@@ -731,7 +737,11 @@ impl CovarianceShrinkage {
                 }
             }
         }
-        let avg_corr = if count > 0 { sum_corr / count as f64 } else { 0.0 };
+        let avg_corr = if count > 0 {
+            sum_corr / count as f64
+        } else {
+            0.0
+        };
 
         let theta = |i: usize, j: usize, k: usize, l: usize| -> f64 {
             let mut acc = 0.0;
@@ -756,8 +766,8 @@ impl CovarianceShrinkage {
                 if std[i] == 0.0 || std[j] == 0.0 {
                     continue;
                 }
-                let term = (std[j] / std[i]) * theta(i, i, i, j)
-                    + (std[i] / std[j]) * theta(j, j, i, j);
+                let term =
+                    (std[j] / std[i]) * theta(i, i, i, j) + (std[i] / std[j]) * theta(j, j, i, j);
                 rho_off += 0.5 * avg_corr * term;
             }
         }
@@ -813,7 +823,9 @@ mod tests {
         // Deterministic pseudo-random walk for two correlated assets.
         let mut state = seed;
         let next = |s: &mut u64| -> f64 {
-            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((*s >> 33) as u32 as f64) / (u32::MAX as f64) - 0.5
         };
         let rows = 200;
@@ -954,11 +966,7 @@ mod tests {
     fn fix_nonpositive_semidefinite_repairs_negatives() {
         // Build an obviously non-PSD symmetric matrix and check the
         // repaired version has non-negative eigenvalues.
-        let m = DMatrix::from_row_slice(3, 3, &[
-            1.0, 0.9, 0.9,
-            0.9, 1.0, -0.95,
-            0.9, -0.95, 1.0,
-        ]);
+        let m = DMatrix::from_row_slice(3, 3, &[1.0, 0.9, 0.9, 0.9, 1.0, -0.95, 0.9, -0.95, 1.0]);
         let fixed = fix_nonpositive_semidefinite(&m, FixMethod::Spectral).unwrap();
         let eig = SymmetricEigen::new(fixed);
         for v in eig.eigenvalues.iter() {

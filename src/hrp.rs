@@ -21,17 +21,12 @@ use crate::{PortfolioError, Result};
 /// `complete` = farthest neighbour, `average` = unweighted mean
 /// (UPGMA). Default is [`LinkageMethod::Single`] (PyPortfolioOpt's
 /// default).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum LinkageMethod {
+    #[default]
     Single,
     Complete,
     Average,
-}
-
-impl Default for LinkageMethod {
-    fn default() -> Self {
-        LinkageMethod::Single
-    }
 }
 
 pub struct HRPOpt {
@@ -144,7 +139,11 @@ impl HRPOpt {
         let ret = expected_returns.dot(w);
         let var = (w.transpose() * &cov * w)[(0, 0)];
         let vol = var.max(0.0).sqrt();
-        let sharpe = if vol > 0.0 { (ret - risk_free_rate) / vol } else { 0.0 };
+        let sharpe = if vol > 0.0 {
+            (ret - risk_free_rate) / vol
+        } else {
+            0.0
+        };
         Ok((ret, vol, sharpe))
     }
 
@@ -205,12 +204,7 @@ pub fn quasi_diagonalise_with(dist: &DMatrix<f64>, method: LinkageMethod) -> Vec
     clusters.into_iter().next().unwrap_or_default()
 }
 
-fn cluster_distance(
-    dist: &DMatrix<f64>,
-    a: &[usize],
-    b: &[usize],
-    method: LinkageMethod,
-) -> f64 {
+fn cluster_distance(dist: &DMatrix<f64>, a: &[usize], b: &[usize], method: LinkageMethod) -> f64 {
     match method {
         LinkageMethod::Single => {
             let mut best = f64::INFINITY;
@@ -243,7 +237,11 @@ fn cluster_distance(
                     count += 1;
                 }
             }
-            if count == 0 { f64::INFINITY } else { acc / count as f64 }
+            if count == 0 {
+                f64::INFINITY
+            } else {
+                acc / count as f64
+            }
         }
     }
 }
@@ -267,11 +265,11 @@ pub fn recursive_bisection(cov: &DMatrix<f64>, order: &[usize]) -> Vec<f64> {
         let inv_left = 1.0 / var_left;
         let inv_right = 1.0 / var_right;
         let alpha = inv_left / (inv_left + inv_right);
-        for k in start..mid {
-            w[k] *= alpha;
+        for v in w.iter_mut().take(mid).skip(start) {
+            *v *= alpha;
         }
-        for k in mid..end {
-            w[k] *= 1.0 - alpha;
+        for v in w.iter_mut().take(end).skip(mid) {
+            *v *= 1.0 - alpha;
         }
         stack.push((start, mid));
         stack.push((mid, end));
@@ -314,7 +312,9 @@ mod tests {
         let rows = 200;
         let mut state = 42_u64;
         let next = |s: &mut u64| -> f64 {
-            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((*s >> 33) as u32 as f64) / (u32::MAX as f64) - 0.5
         };
         let mut r = DMatrix::<f64>::zeros(rows, 5);
@@ -383,7 +383,9 @@ mod tests {
             LinkageMethod::Complete,
             LinkageMethod::Average,
         ] {
-            let mut hrp = HRPOpt::from_returns(r.clone()).unwrap().with_linkage(method);
+            let mut hrp = HRPOpt::from_returns(r.clone())
+                .unwrap()
+                .with_linkage(method);
             let w = hrp.optimize().unwrap();
             let total: f64 = w.iter().sum();
             assert_relative_eq!(total, 1.0, epsilon = 1e-9);

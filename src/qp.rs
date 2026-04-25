@@ -26,12 +26,12 @@ use crate::{PortfolioError, Result};
 
 /// Convex QP with linear equalities and box bounds.
 pub struct QpProblem {
-    pub p: DMatrix<f64>,        // n x n, symmetric, PSD
-    pub q: DVector<f64>,        // n
-    pub a_eq: DMatrix<f64>,     // m_eq x n  (may have 0 rows)
-    pub b_eq: DVector<f64>,     // m_eq
-    pub lb: DVector<f64>,       // n
-    pub ub: DVector<f64>,       // n
+    pub p: DMatrix<f64>,    // n x n, symmetric, PSD
+    pub q: DVector<f64>,    // n
+    pub a_eq: DMatrix<f64>, // m_eq x n  (may have 0 rows)
+    pub b_eq: DVector<f64>, // m_eq
+    pub lb: DVector<f64>,   // n
+    pub ub: DVector<f64>,   // n
 }
 
 impl QpProblem {
@@ -45,9 +45,7 @@ impl QpProblem {
     ) -> Result<Self> {
         let n = p.nrows();
         if p.ncols() != n {
-            return Err(PortfolioError::DimensionMismatch(
-                "P must be square".into(),
-            ));
+            return Err(PortfolioError::DimensionMismatch("P must be square".into()));
         }
         if q.len() != n {
             return Err(PortfolioError::DimensionMismatch(
@@ -76,7 +74,14 @@ impl QpProblem {
                 )));
             }
         }
-        Ok(Self { p, q, a_eq, b_eq, lb, ub })
+        Ok(Self {
+            p,
+            q,
+            a_eq,
+            b_eq,
+            lb,
+            ub,
+        })
     }
 }
 
@@ -177,9 +182,9 @@ pub fn solve(prob: &QpProblem, settings: QpSettings) -> Result<DVector<f64>> {
         for r in 0..m {
             rhs[n + r] = prob.b_eq[r];
         }
-        let sol = lu.solve(&rhs).ok_or_else(|| {
-            PortfolioError::OptimisationFailed("KKT linear solve failed".into())
-        })?;
+        let sol = lu
+            .solve(&rhs)
+            .ok_or_else(|| PortfolioError::OptimisationFailed("KKT linear solve failed".into()))?;
         for i in 0..n {
             x[i] = sol[i];
         }

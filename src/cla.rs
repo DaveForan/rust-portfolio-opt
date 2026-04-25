@@ -118,7 +118,9 @@ impl CLA {
         self.ensure_frontier()?;
         let nc = self.corner_weights.len();
         if nc == 0 {
-            return Err(PortfolioError::OptimisationFailed("no corner portfolios".into()));
+            return Err(PortfolioError::OptimisationFailed(
+                "no corner portfolios".into(),
+            ));
         }
 
         let sharpe = |w: &DVector<f64>| {
@@ -207,9 +209,7 @@ impl CLA {
     /// `(return, vol, Sharpe)` for the most recently solved portfolio.
     pub fn portfolio_performance(&self, risk_free_rate: f64) -> Result<(f64, f64, f64)> {
         let w = self.weights.as_ref().ok_or_else(|| {
-            PortfolioError::InvalidArgument(
-                "no weights — call min_vol or max_sharpe first".into(),
-            )
+            PortfolioError::InvalidArgument("no weights — call min_vol or max_sharpe first".into())
         })?;
         let (ret, vol) = portfolio_perf(w, &self.mu, &self.sigma);
         let sharpe = if vol > 0.0 {
@@ -268,8 +268,7 @@ impl CLA {
             };
 
             // Find next transition.
-            let (t_lambda, t_event) =
-                self.find_transition(&free, &w_current, &kkt, lambda)?;
+            let (t_lambda, t_event) = self.find_transition(&free, &w_current, &kkt, lambda)?;
 
             if t_lambda < -1e-10 {
                 // No more valid transitions; record current and stop.
@@ -355,9 +354,7 @@ impl CLA {
 
         let lu = m.lu();
         if lu.determinant().abs() < 1e-20 {
-            return Err(PortfolioError::Singular(
-                "KKT matrix is singular".into(),
-            ));
+            return Err(PortfolioError::Singular("KKT matrix is singular".into()));
         }
 
         // RHS for α: solve M [α_F; α_γ] = [μ_F; 0]
@@ -442,7 +439,10 @@ impl CLA {
         let mut best_lambda = -1.0_f64;
         let mut best_event = TransitionEvent::None;
 
-        let try_update = |candidate: f64, ev: TransitionEvent, best_l: &mut f64, best_e: &mut TransitionEvent| {
+        let try_update = |candidate: f64,
+                          ev: TransitionEvent,
+                          best_l: &mut f64,
+                          best_e: &mut TransitionEvent| {
             if candidate >= 0.0 && candidate < current_finite - EPS && candidate > *best_l + EPS {
                 *best_l = candidate;
                 *best_e = ev;
@@ -457,12 +457,22 @@ impl CLA {
                 // Hits lower bound: af * λ + bf = lb  →  λ = (lb - bf) / af
                 let lam_lb = (self.lb[i] - bf) / af;
                 if lam_lb > 0.0 {
-                    try_update(lam_lb, TransitionEvent::FreeHitsLower(k), &mut best_lambda, &mut best_event);
+                    try_update(
+                        lam_lb,
+                        TransitionEvent::FreeHitsLower(k),
+                        &mut best_lambda,
+                        &mut best_event,
+                    );
                 }
                 // Hits upper bound: af * λ + bf = ub  →  λ = (ub - bf) / af
                 let lam_ub = (self.ub[i] - bf) / af;
                 if lam_ub > 0.0 {
-                    try_update(lam_ub, TransitionEvent::FreeHitsUpper(k), &mut best_lambda, &mut best_event);
+                    try_update(
+                        lam_ub,
+                        TransitionEvent::FreeHitsUpper(k),
+                        &mut best_lambda,
+                        &mut best_event,
+                    );
                 }
             }
         }
@@ -522,7 +532,12 @@ impl CLA {
             };
 
             if valid {
-                try_update(lam_z, TransitionEvent::BoundBecomeFree(i), &mut best_lambda, &mut best_event);
+                try_update(
+                    lam_z,
+                    TransitionEvent::BoundBecomeFree(i),
+                    &mut best_lambda,
+                    &mut best_event,
+                );
             }
         }
 
@@ -572,11 +587,7 @@ impl CLA {
 
     /// Interpolate the portfolio at a given target return within the
     /// pre-computed corner portfolios.
-    fn portfolio_at_return(
-        &self,
-        target_ret: f64,
-        perf: &[(f64, f64)],
-    ) -> Result<DVector<f64>> {
+    fn portfolio_at_return(&self, target_ret: f64, perf: &[(f64, f64)]) -> Result<DVector<f64>> {
         let nc = self.corner_weights.len();
         // Perf is ordered high→low return.
         for i in 0..nc.saturating_sub(1) {
@@ -626,8 +637,8 @@ struct KktSolution {
 
 #[derive(Debug, Clone)]
 enum TransitionEvent {
-    FreeHitsLower(usize),  // index *into* free vec
-    FreeHitsUpper(usize),  // index *into* free vec
+    FreeHitsLower(usize),   // index *into* free vec
+    FreeHitsUpper(usize),   // index *into* free vec
     BoundBecomeFree(usize), // asset index
     None,
 }
@@ -664,7 +675,11 @@ fn golden_section_max_sharpe(
         let ret = mu.dot(&w);
         let var = (w.transpose() * sigma * &w)[(0, 0)];
         let vol = var.max(0.0).sqrt();
-        if vol < 1e-12 { f64::NEG_INFINITY } else { (ret - rf) / vol }
+        if vol < 1e-12 {
+            f64::NEG_INFINITY
+        } else {
+            (ret - rf) / vol
+        }
     };
 
     let mut lo = 0.0_f64;
@@ -792,7 +807,10 @@ mod tests {
         let pts = cla.efficient_frontier(10).unwrap();
         assert_eq!(pts.len(), 10);
         for i in 1..pts.len() {
-            assert!(pts[i].0 <= pts[i - 1].0 + 1e-8, "returns not sorted descending");
+            assert!(
+                pts[i].0 <= pts[i - 1].0 + 1e-8,
+                "returns not sorted descending"
+            );
         }
     }
 
