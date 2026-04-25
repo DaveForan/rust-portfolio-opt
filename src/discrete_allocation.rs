@@ -12,9 +12,23 @@
 
 use std::collections::HashMap;
 
-use nalgebra::DVector;
+use nalgebra::{DMatrix, DVector};
 
 use crate::{PortfolioError, Result};
+
+/// Extract the most recent (last-row) price for each asset from a price
+/// matrix, mirroring `pypfopt.discrete_allocation.get_latest_prices`.
+/// The price matrix is `T x N` (rows = dates oldest→newest, columns =
+/// assets); the result is an `N`-vector of the latest closes.
+pub fn get_latest_prices(prices: &DMatrix<f64>) -> Result<DVector<f64>> {
+    let rows = prices.nrows();
+    if rows == 0 {
+        return Err(PortfolioError::InvalidArgument(
+            "price matrix has no rows".into(),
+        ));
+    }
+    Ok(prices.row(rows - 1).transpose().into_owned())
+}
 
 /// Converts continuous portfolio weights into integer share counts.
 ///
@@ -263,6 +277,20 @@ fn greedy_one_side(
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+    use nalgebra::dmatrix;
+
+    #[test]
+    fn get_latest_prices_returns_last_row() {
+        let prices = dmatrix![
+            100.0, 200.0;
+            101.0, 199.0;
+            102.0, 198.0
+        ];
+        let latest = get_latest_prices(&prices).unwrap();
+        assert_eq!(latest.len(), 2);
+        assert_relative_eq!(latest[0], 102.0);
+        assert_relative_eq!(latest[1], 198.0);
+    }
 
     #[test]
     fn greedy_does_not_exceed_budget() {

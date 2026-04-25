@@ -1,17 +1,23 @@
-# Rust
-/target
+# Rust build output
+/target/
 **/*.rs.bk
 
-# Pure library — Cargo.lock is excluded so downstream consumers resolve
-# their own dependency versions.
+# Cargo.lock — library crate, not a binary entrypoint
 Cargo.lock
 
-# IDE / OS noise
+# Debug symbols (Windows)
+*.pdb
+
+# Editor/IDE
 .idea/
 .vscode/
+*.iml
+
+# macOS
 .DS_Store
 
-# Test / debug artefacts
+# Benchmark/profiling artifacts
 *.profraw
+perf.data
+perf.data.old
 flamegraph.svg
-perf.data*

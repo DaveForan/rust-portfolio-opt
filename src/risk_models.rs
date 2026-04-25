@@ -6,8 +6,20 @@
 
 use nalgebra::{DMatrix, DVector, SymmetricEigen};
 
-use crate::prelude::{column_means, returns_from_prices, sample_covariance, symmetrise};
+use crate::expected_returns::ReturnsKind;
+use crate::prelude::{
+    column_means, log_returns_from_prices, returns_from_prices, sample_covariance, symmetrise,
+};
 use crate::{PortfolioError, Result, TRADING_DAYS_PER_YEAR};
+
+/// Build a `T-1 x N` returns matrix from a `T x N` price matrix using the
+/// requested return kind. Mirrors PyPortfolioOpt's `log_returns` flag.
+fn returns_with_kind(prices: &DMatrix<f64>, kind: ReturnsKind) -> Result<DMatrix<f64>> {
+    match kind {
+        ReturnsKind::Simple => returns_from_prices(prices),
+        ReturnsKind::Log => log_returns_from_prices(prices),
+    }
+}
 
 /// Default daily benchmark used by [`semicovariance`] when none is
 /// supplied. Matches PyPortfolioOpt: `(1 + 0.02)^(1/252) - 1`.
@@ -71,10 +83,24 @@ pub fn fix_nonpositive_semidefinite(matrix: &DMatrix<f64>, method: FixMethod) ->
     Ok(out)
 }
 
-/// Plain sample covariance, annualised.
-pub fn sample_cov(prices: &DMatrix<f64>, frequency: Option<usize>) -> Result<DMatrix<f64>> {
-    let returns = returns_from_prices(prices)?;
-    let cov = sample_covariance(&returns)?;
+/// Plain sample covariance, annualised. `kind` selects simple vs log
+/// returns (matches PyPortfolioOpt's `log_returns` flag).
+pub fn sample_cov(
+    prices: &DMatrix<f64>,
+    kind: ReturnsKind,
+    frequency: Option<usize>,
+) -> Result<DMatrix<f64>> {
+    let returns = returns_with_kind(prices, kind)?;
+    sample_cov_from_returns(&returns, frequency)
+}
+
+/// Sample covariance computed from an already-built returns matrix
+/// (PyPortfolioOpt's `returns_data=True` path).
+pub fn sample_cov_from_returns(
+    returns: &DMatrix<f64>,
+    frequency: Option<usize>,
+) -> Result<DMatrix<f64>> {
+    let cov = sample_covariance(returns)?;
     let f = frequency.unwrap_or(TRADING_DAYS_PER_YEAR) as f64;
     Ok(cov * f)
 }
@@ -85,10 +111,20 @@ pub fn sample_cov(prices: &DMatrix<f64>, frequency: Option<usize>) -> Result<DMa
 pub fn semicovariance(
     prices: &DMatrix<f64>,
     benchmark: Option<f64>,
+    kind: ReturnsKind,
+    frequency: Option<usize>,
+) -> Result<DMatrix<f64>> {
+    let returns = returns_with_kind(prices, kind)?;
+    semicovariance_from_returns(&returns, benchmark, frequency)
+}
+
+/// Semi-covariance computed from an already-built returns matrix.
+pub fn semicovariance_from_returns(
+    returns: &DMatrix<f64>,
+    benchmark: Option<f64>,
     frequency: Option<usize>,
 ) -> Result<DMatrix<f64>> {
     let benchmark = benchmark.unwrap_or(DEFAULT_SEMICOV_BENCHMARK);
-    let returns = returns_from_prices(prices)?;
     let (rows, cols) = returns.shape();
     if rows < 2 {
         return Err(PortfolioError::InvalidArgument(
@@ -110,17 +146,34 @@ pub fn semicovariance(
     Ok(cov * f)
 }
 
-/// Exponentially-weighted covariance with span `span`. Most recent
-/// observations carry the largest weight (`adjust=True` semantics).
+/// Default span for [`exp_cov`], matching PyPortfolioOpt.
+pub const DEFAULT_EXP_COV_SPAN: usize = 180;
+
+/// Exponentially-weighted covariance. `span` defaults to
+/// [`DEFAULT_EXP_COV_SPAN`] (180) when `None` — matches PyPortfolioOpt.
+/// Most recent observations carry the largest weight (`adjust=True`
+/// semantics).
 pub fn exp_cov(
     prices: &DMatrix<f64>,
-    span: usize,
+    kind: ReturnsKind,
+    span: Option<usize>,
     frequency: Option<usize>,
 ) -> Result<DMatrix<f64>> {
+    let returns = returns_with_kind(prices, kind)?;
+    exp_cov_from_returns(&returns, span, frequency)
+}
+
+/// Exponentially-weighted covariance computed from an already-built
+/// returns matrix (PyPortfolioOpt's `returns_data=True` path).
+pub fn exp_cov_from_returns(
+    returns: &DMatrix<f64>,
+    span: Option<usize>,
+    frequency: Option<usize>,
+) -> Result<DMatrix<f64>> {
+    let span = span.unwrap_or(DEFAULT_EXP_COV_SPAN);
     if span < 1 {
         return Err(PortfolioError::InvalidArgument("span must be >= 1".into()));
     }
-    let returns = returns_from_prices(prices)?;
     let (rows, cols) = returns.shape();
     if rows < 2 {
         return Err(PortfolioError::InvalidArgument(
@@ -216,29 +269,34 @@ pub fn corr_to_cov(corr: &DMatrix<f64>, std: &DVector<f64>) -> Result<DMatrix<f6
 }
 
 /// String-based dispatcher mirroring `pypfopt.risk_models.risk_matrix`.
-/// Accepted methods (case-insensitive): `sample_cov`, `semicovariance` /
-/// `semivariance`, `exp_cov`, `ledoit_wolf` (alias of
-/// `ledoit_wolf_constant_variance`), `ledoit_wolf_constant_variance`,
-/// `ledoit_wolf_single_factor`, `ledoit_wolf_constant_correlation`,
-/// `oracle_approximating`.
+/// `kind` selects simple vs log returns when the underlying estimator
+/// derives returns from prices. Accepted methods (case-insensitive):
+/// `sample_cov`, `semicovariance` / `semivariance`, `exp_cov`,
+/// `ledoit_wolf` (alias of `ledoit_wolf_constant_variance`),
+/// `ledoit_wolf_constant_variance`, `ledoit_wolf_single_factor`,
+/// `ledoit_wolf_constant_correlation`, `oracle_approximating`.
 pub fn risk_matrix(
     prices: &DMatrix<f64>,
     method: &str,
+    kind: ReturnsKind,
     frequency: Option<usize>,
 ) -> Result<DMatrix<f64>> {
     let m = method.trim().to_ascii_lowercase();
     match m.as_str() {
-        "sample_cov" => sample_cov(prices, frequency),
-        "semicovariance" | "semivariance" => semicovariance(prices, None, frequency),
-        "exp_cov" => exp_cov(prices, 180, frequency),
-        "ledoit_wolf" | "ledoit_wolf_constant_variance" => CovarianceShrinkage::new(prices, frequency)?
-            .ledoit_wolf(LedoitWolfTarget::ConstantVariance),
-        "ledoit_wolf_single_factor" => CovarianceShrinkage::new(prices, frequency)?
+        "sample_cov" => sample_cov(prices, kind, frequency),
+        "semicovariance" | "semivariance" => semicovariance(prices, None, kind, frequency),
+        "exp_cov" => exp_cov(prices, kind, None, frequency),
+        "ledoit_wolf" | "ledoit_wolf_constant_variance" => {
+            CovarianceShrinkage::new(prices, kind, frequency)?
+                .ledoit_wolf(LedoitWolfTarget::ConstantVariance)
+        }
+        "ledoit_wolf_single_factor" => CovarianceShrinkage::new(prices, kind, frequency)?
             .ledoit_wolf(LedoitWolfTarget::SingleFactor),
-        "ledoit_wolf_constant_correlation" => CovarianceShrinkage::new(prices, frequency)?
+        "ledoit_wolf_constant_correlation" => CovarianceShrinkage::new(prices, kind, frequency)?
             .ledoit_wolf(LedoitWolfTarget::ConstantCorrelation),
-        "oracle_approximating" => CovarianceShrinkage::new(prices, frequency)?
-            .oracle_approximating(),
+        "oracle_approximating" => {
+            CovarianceShrinkage::new(prices, kind, frequency)?.oracle_approximating()
+        }
         other => Err(PortfolioError::InvalidArgument(format!(
             "unknown risk_matrix method '{other}'"
         ))),
@@ -284,8 +342,14 @@ pub struct CovarianceShrinkage {
 }
 
 impl CovarianceShrinkage {
-    pub fn new(prices: &DMatrix<f64>, frequency: Option<usize>) -> Result<Self> {
-        let returns = returns_from_prices(prices)?;
+    /// Construct from a price matrix. `kind` selects simple vs log
+    /// returns (matches PyPortfolioOpt's `log_returns` flag).
+    pub fn new(
+        prices: &DMatrix<f64>,
+        kind: ReturnsKind,
+        frequency: Option<usize>,
+    ) -> Result<Self> {
+        let returns = returns_with_kind(prices, kind)?;
         Ok(Self {
             returns,
             frequency: frequency.unwrap_or(TRADING_DAYS_PER_YEAR) as f64,
@@ -769,7 +833,7 @@ mod tests {
     #[test]
     fn sample_cov_is_symmetric_and_psd_ish() {
         let p = make_prices(7);
-        let cov = sample_cov(&p, Some(252)).unwrap();
+        let cov = sample_cov(&p, ReturnsKind::Simple, Some(252)).unwrap();
         for i in 0..3 {
             for j in 0..3 {
                 assert_relative_eq!(cov[(i, j)], cov[(j, i)], max_relative = 1e-12);
@@ -785,7 +849,7 @@ mod tests {
         // `min(r - target, 0)²`, annualised. Reproduce the formula directly
         // and compare element-wise.
         let p = make_prices(11);
-        let semi = semicovariance(&p, Some(0.0), Some(252)).unwrap();
+        let semi = semicovariance(&p, Some(0.0), ReturnsKind::Simple, Some(252)).unwrap();
         let returns = returns_from_prices(&p).unwrap();
         let (t, n) = returns.shape();
         for i in 0..n {
@@ -808,8 +872,8 @@ mod tests {
         // uses T-1). For a moderately large span the variances will be
         // close on the same order of magnitude.
         let p = make_prices(3);
-        let cov = sample_cov(&p, Some(252)).unwrap();
-        let ewma = exp_cov(&p, 10_000, Some(252)).unwrap();
+        let cov = sample_cov(&p, ReturnsKind::Simple, Some(252)).unwrap();
+        let ewma = exp_cov(&p, ReturnsKind::Simple, Some(10_000), Some(252)).unwrap();
         for i in 0..3 {
             // Within 5% of the sample covariance for a non-extreme span.
             assert!((ewma[(i, i)] - cov[(i, i)]).abs() / cov[(i, i)] < 0.05);
@@ -819,7 +883,7 @@ mod tests {
     #[test]
     fn cov_corr_round_trip() {
         let p = make_prices(13);
-        let cov = sample_cov(&p, Some(252)).unwrap();
+        let cov = sample_cov(&p, ReturnsKind::Simple, Some(252)).unwrap();
         let corr = cov_to_corr(&cov).unwrap();
         let std = DVector::from_iterator(3, (0..3).map(|i| cov[(i, i)].sqrt()));
         let cov2 = corr_to_cov(&corr, &std).unwrap();
@@ -833,7 +897,7 @@ mod tests {
     #[test]
     fn corr_diagonal_is_one() {
         let p = make_prices(17);
-        let cov = sample_cov(&p, Some(252)).unwrap();
+        let cov = sample_cov(&p, ReturnsKind::Simple, Some(252)).unwrap();
         let corr = cov_to_corr(&cov).unwrap();
         for i in 0..3 {
             assert_relative_eq!(corr[(i, i)], 1.0, max_relative = 1e-12);
@@ -843,7 +907,7 @@ mod tests {
     #[test]
     fn ledoit_wolf_runs_and_is_symmetric() {
         let p = make_prices(19);
-        let mut cs = CovarianceShrinkage::new(&p, Some(252)).unwrap();
+        let mut cs = CovarianceShrinkage::new(&p, ReturnsKind::Simple, Some(252)).unwrap();
         let shrunk = cs.ledoit_wolf(LedoitWolfTarget::ConstantVariance).unwrap();
         for i in 0..3 {
             for j in 0..3 {
@@ -862,7 +926,7 @@ mod tests {
             LedoitWolfTarget::SingleFactor,
             LedoitWolfTarget::ConstantCorrelation,
         ] {
-            let mut cs = CovarianceShrinkage::new(&p, Some(252)).unwrap();
+            let mut cs = CovarianceShrinkage::new(&p, ReturnsKind::Simple, Some(252)).unwrap();
             let shrunk = cs.ledoit_wolf(target).unwrap();
             for i in 0..3 {
                 for j in 0..3 {
@@ -876,7 +940,7 @@ mod tests {
     #[test]
     fn shrunk_covariance_intensity_validation() {
         let p = make_prices(29);
-        let mut cs = CovarianceShrinkage::new(&p, Some(252)).unwrap();
+        let mut cs = CovarianceShrinkage::new(&p, ReturnsKind::Simple, Some(252)).unwrap();
         assert!(cs.shrunk_covariance(-0.1).is_err());
         assert!(cs.shrunk_covariance(1.5).is_err());
         let shrunk = cs.shrunk_covariance(0.2).unwrap();
@@ -905,7 +969,7 @@ mod tests {
     #[test]
     fn oracle_runs_and_is_symmetric() {
         let p = make_prices(23);
-        let shrunk = CovarianceShrinkage::new(&p, Some(252))
+        let shrunk = CovarianceShrinkage::new(&p, ReturnsKind::Simple, Some(252))
             .unwrap()
             .oracle_approximating()
             .unwrap();

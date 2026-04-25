@@ -110,11 +110,15 @@ impl HRPOpt {
     }
 
     /// `(annualised return, annualised vol, Sharpe)` from the cached
-    /// HRP weights and a caller-supplied expected-return vector.
+    /// HRP weights and a caller-supplied expected-return vector. The
+    /// internal covariance (computed from `self.returns`) is annualised
+    /// by `frequency` (defaults to 252) so the result is comparable to
+    /// the caller's annualised expected returns.
     pub fn portfolio_performance(
         &self,
         expected_returns: &DVector<f64>,
         risk_free_rate: f64,
+        frequency: Option<usize>,
     ) -> Result<(f64, f64, f64)> {
         let w = self.weights.as_ref().ok_or_else(|| {
             PortfolioError::InvalidArgument(
@@ -128,7 +132,15 @@ impl HRPOpt {
                 w.len()
             )));
         }
-        let cov = self.cov()?;
+        let f = frequency.unwrap_or(crate::TRADING_DAYS_PER_YEAR) as f64;
+        // If the user supplied a precomputed cov (cov_override) they're
+        // expected to have annualised it themselves; otherwise we
+        // annualise the per-period sample cov.
+        let cov = if self.cov_override.is_some() {
+            self.cov()?
+        } else {
+            self.cov()? * f
+        };
         let ret = expected_returns.dot(w);
         let var = (w.transpose() * &cov * w)[(0, 0)];
         let vol = var.max(0.0).sqrt();
@@ -397,7 +409,7 @@ mod tests {
         let mut hrp = HRPOpt::from_returns(r).unwrap();
         hrp.optimize().unwrap();
         let mu = DVector::from_vec(vec![0.05, 0.06, 0.04, 0.05, 0.03]);
-        let (ret, vol, _sh) = hrp.portfolio_performance(&mu, 0.0).unwrap();
+        let (ret, vol, _sh) = hrp.portfolio_performance(&mu, 0.0, None).unwrap();
         assert!(ret.is_finite());
         assert!(vol > 0.0);
     }

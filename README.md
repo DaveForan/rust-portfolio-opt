@@ -149,7 +149,20 @@ All other estimators agree to within solver-iterate precision (1e-6 or tighter).
 | Weight cleaning | yes | yes |
 | Frontier plotting | matplotlib | bring your own |
 
-If you need sector constraints or LP-based discrete allocation, stay with PyPortfolioOpt — wiring those into Rust would mean pulling in an MILP / general convex solver. Everything else is at parity.
+### Deferred features
+
+These pieces of PyPortfolioOpt are intentionally not (yet) ported because they would require pulling in a heavier solver dependency or a third-party stat library. PRs welcome.
+
+- **`EfficientSemivariance`** — minimise downside-only variance. Doable in the current QP backend with auxiliary variables; not implemented yet.
+- **`EfficientCVaR`** — minimise Conditional Value-at-Risk. Requires an LP solver (the formulation has T inequality constraints, one per observation).
+- **`EfficientCDaR`** — minimise Conditional Drawdown-at-Risk. Same LP-solver requirement as CVaR, with an additional path-dependent constraint.
+- **`DiscreteAllocation::lp_portfolio`** — exact integer-LP allocation. Requires an MILP solver such as `coin-cbc` or `highs`.
+- **`min_cov_determinant`** — robust Minimum Covariance Determinant estimator. Wraps scikit-learn's `fast_mcd`; would need a pure-Rust port of the FAST-MCD algorithm.
+- **Sector constraints, custom convex objectives** (`add_constraint`, `add_sector_constraints`, `convex_objective`, `nonconvex_objective`) — depend on cvxpy's general inequality and DSL support.
+- **`transaction_cost`, `ex_ante_tracking_error`, `ex_post_tracking_error`** — objective-function helpers that need L¹ norm or benchmark-relative variance constraints outside the QP scope.
+- **Plotting** — out of scope by design. The crate exports the underlying data (frontier points, dendrogram link matrix) so callers can render with their plotting library of choice.
+
+If you need any of these today, stay with PyPortfolioOpt — everything else is at parity.
 
 ## Status
 

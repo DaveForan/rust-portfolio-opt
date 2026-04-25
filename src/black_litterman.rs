@@ -355,6 +355,36 @@ pub fn relative_view(n: usize, asset_long: usize, asset_short: usize) -> Result<
     Ok(row)
 }
 
+/// Convert a list of absolute views into the picking matrix `P` and view
+/// vector `Q` expected by [`BlackLittermanModel::new`]. Each entry is
+/// `(asset_idx, expected_return)`; the resulting `P` has one row per view
+/// with a single `1.0` in the corresponding column. Mirrors
+/// PyPortfolioOpt's `BlackLittermanModel._parse_views` for the
+/// dict-of-absolute-views path.
+pub fn parse_absolute_views(
+    n_assets: usize,
+    views: &[(usize, f64)],
+) -> Result<(DMatrix<f64>, DVector<f64>)> {
+    if views.is_empty() {
+        return Err(PortfolioError::InvalidArgument(
+            "need at least one view".into(),
+        ));
+    }
+    let k = views.len();
+    let mut p = DMatrix::<f64>::zeros(k, n_assets);
+    let mut q = DVector::<f64>::zeros(k);
+    for (row, (asset_idx, expected_return)) in views.iter().enumerate() {
+        if *asset_idx >= n_assets {
+            return Err(PortfolioError::InvalidArgument(format!(
+                "asset_idx {asset_idx} out of range for n = {n_assets}"
+            )));
+        }
+        p[(row, *asset_idx)] = 1.0;
+        q[row] = *expected_return;
+    }
+    Ok((p, q))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +484,26 @@ mod tests {
     fn invalid_relative_view_indices() {
         assert!(relative_view(3, 0, 0).is_err());
         assert!(relative_view(3, 5, 1).is_err());
+    }
+
+    #[test]
+    fn parse_absolute_views_builds_picking_matrix() {
+        let (p, q) = parse_absolute_views(4, &[(0, 0.05), (2, 0.10)]).unwrap();
+        assert_eq!(p.shape(), (2, 4));
+        assert_eq!(q.len(), 2);
+        assert_relative_eq!(p[(0, 0)], 1.0);
+        assert_relative_eq!(p[(1, 2)], 1.0);
+        assert_relative_eq!(q[0], 0.05);
+        assert_relative_eq!(q[1], 0.10);
+        // Other entries are zero.
+        assert_relative_eq!(p[(0, 1)], 0.0);
+        assert_relative_eq!(p[(1, 3)], 0.0);
+    }
+
+    #[test]
+    fn parse_absolute_views_rejects_bad_indices() {
+        assert!(parse_absolute_views(3, &[(5, 0.05)]).is_err());
+        assert!(parse_absolute_views(3, &[]).is_err());
     }
 
     #[test]
