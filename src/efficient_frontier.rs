@@ -31,6 +31,13 @@ pub struct EfficientFrontier {
     pub cov: DMatrix<f64>,
     pub bounds: Vec<WeightBound>,
     pub solver_settings: QpSettings,
+    /// L2 regularisation strength: an extra `½ γ ||w||²` is added to the
+    /// objective. Mirrors `EfficientFrontier.add_objective(L2_reg, gamma)`
+    /// in PyPortfolioOpt. Defaults to 0 (no regularisation).
+    pub l2_gamma: f64,
+    /// Market-neutral mode: enforce `1ᵀw = 0` instead of `1ᵀw = 1`. The
+    /// caller must allow negative bounds to make the problem feasible.
+    pub market_neutral: bool,
     weights: Option<DVector<f64>>,
 }
 
@@ -48,8 +55,48 @@ impl EfficientFrontier {
             cov,
             bounds: vec![(0.0, 1.0); n],
             solver_settings: QpSettings::default(),
+            l2_gamma: 0.0,
+            market_neutral: false,
             weights: None,
         })
+    }
+
+    /// Add an L2 regularisation term `½ γ ||w||²` to every subsequent
+    /// optimisation. Mirrors `add_objective(objective_functions.L2_reg)`
+    /// in PyPortfolioOpt.
+    pub fn with_l2_reg(mut self, gamma: f64) -> Result<Self> {
+        if gamma < 0.0 {
+            return Err(PortfolioError::InvalidArgument(
+                "L2 reg gamma must be non-negative".into(),
+            ));
+        }
+        self.l2_gamma = gamma;
+        Ok(self)
+    }
+
+    /// Switch the budget constraint from `1ᵀw = 1` to `1ᵀw = 0` so the
+    /// portfolio is dollar-neutral. Caller must supply bounds that allow
+    /// shorts (e.g. `with_uniform_bounds(-1.0, 1.0)`).
+    pub fn with_market_neutral(mut self, market_neutral: bool) -> Self {
+        self.market_neutral = market_neutral;
+        self
+    }
+
+    /// Effective covariance with L2 regularisation applied.
+    fn p_matrix(&self) -> DMatrix<f64> {
+        if self.l2_gamma > 0.0 {
+            let mut p = self.cov.clone();
+            for i in 0..p.nrows() {
+                p[(i, i)] += self.l2_gamma;
+            }
+            p
+        } else {
+            self.cov.clone()
+        }
+    }
+
+    fn budget_target(&self) -> f64 {
+        if self.market_neutral { 0.0 } else { 1.0 }
     }
 
     pub fn with_bounds(mut self, bounds: Vec<WeightBound>) -> Result<Self> {
@@ -98,9 +145,46 @@ impl EfficientFrontier {
         let n = self.n();
         let q = DVector::<f64>::zeros(n);
         let a = DMatrix::from_row_slice(1, n, &vec![1.0_f64; n]);
-        let b = DVector::from_vec(vec![1.0]);
+        let b = DVector::from_vec(vec![self.budget_target()]);
         let (lb, ub) = self.lb_ub();
-        let prob = QpProblem::new(self.cov.clone(), q, a, b, lb, ub)?;
+        let prob = QpProblem::new(self.p_matrix(), q, a, b, lb, ub)?;
+        let w = solve(&prob, self.solver_settings)?;
+        self.weights = Some(w.clone());
+        Ok(w)
+    }
+
+    /// Maximise quadratic utility `μᵀw - ½ δ wᵀΣw`. Equivalent to
+    /// `EfficientFrontier.max_quadratic_utility(risk_aversion=δ)` in
+    /// PyPortfolioOpt. When `market_neutral` is `false`, weights sum
+    /// to 1; otherwise the result is dollar-neutral. The `market_neutral`
+    /// argument overrides the value set by [`Self::with_market_neutral`].
+    pub fn max_quadratic_utility(
+        &mut self,
+        risk_aversion: f64,
+        market_neutral: Option<bool>,
+    ) -> Result<DVector<f64>> {
+        if risk_aversion <= 0.0 {
+            return Err(PortfolioError::InvalidArgument(
+                "risk_aversion must be positive".into(),
+            ));
+        }
+        let n = self.n();
+        // P = δ Σ + γ I; q = -μ.  ½ wᵀ(δΣ + γI)w + (-μ)ᵀw.
+        let mut p = self.cov.clone() * risk_aversion;
+        if self.l2_gamma > 0.0 {
+            for i in 0..n {
+                p[(i, i)] += self.l2_gamma;
+            }
+        }
+        let q = -self.expected_returns.clone();
+        let a = DMatrix::from_row_slice(1, n, &vec![1.0_f64; n]);
+        let target = market_neutral
+            .unwrap_or(self.market_neutral)
+            .then_some(0.0)
+            .unwrap_or(1.0);
+        let b = DVector::from_vec(vec![target]);
+        let (lb, ub) = self.lb_ub();
+        let prob = QpProblem::new(p, q, a, b, lb, ub)?;
         let w = solve(&prob, self.solver_settings)?;
         self.weights = Some(w.clone());
         Ok(w)
@@ -178,9 +262,9 @@ impl EfficientFrontier {
             a[(0, j)] = 1.0;
             a[(1, j)] = self.expected_returns[j];
         }
-        let b = DVector::from_vec(vec![1.0, target_return]);
+        let b = DVector::from_vec(vec![self.budget_target(), target_return]);
         let (lb, ub) = self.lb_ub();
-        let prob = QpProblem::new(self.cov.clone(), q, a, b, lb, ub)?;
+        let prob = QpProblem::new(self.p_matrix(), q, a, b, lb, ub)?;
         let w = solve(&prob, self.solver_settings)?;
         self.weights = Some(w.clone());
         Ok(w)
@@ -195,13 +279,14 @@ impl EfficientFrontier {
             ));
         }
 
-        let saved_bounds = self.bounds.clone();
         let mv = {
             let mut clone = EfficientFrontier {
                 expected_returns: self.expected_returns.clone(),
                 cov: self.cov.clone(),
-                bounds: saved_bounds.clone(),
+                bounds: self.bounds.clone(),
                 solver_settings: self.solver_settings,
+                l2_gamma: self.l2_gamma,
+                market_neutral: self.market_neutral,
                 weights: None,
             };
             clone.min_volatility()?
@@ -281,25 +366,7 @@ impl EfficientFrontier {
                 "no weights yet — call an optimiser before clean_weights".into(),
             )
         })?;
-        let mut cleaned = w.clone();
-        for v in cleaned.iter_mut() {
-            if v.abs() < cutoff {
-                *v = 0.0;
-            }
-        }
-        let total: f64 = cleaned.iter().sum();
-        if total.abs() > 1e-12 {
-            for v in cleaned.iter_mut() {
-                *v /= total;
-            }
-        }
-        if let Some(places) = rounding {
-            let factor = 10f64.powi(places as i32);
-            for v in cleaned.iter_mut() {
-                *v = (*v * factor).round() / factor;
-            }
-        }
-        Ok(cleaned)
+        Ok(crate::prelude::clean_weights(w, cutoff, rounding))
     }
 }
 
@@ -396,6 +463,53 @@ mod tests {
         ef.min_volatility().unwrap();
         let (ret, vol, sharpe) = ef.portfolio_performance(0.0).unwrap();
         assert!(ret.is_finite() && vol > 0.0 && sharpe.is_finite());
+    }
+
+    #[test]
+    fn max_quadratic_utility_recovers_two_asset_solution() {
+        // For uncorrelated assets and δ = 1, the maximiser of
+        // μᵀw - 0.5 wᵀΣw subject to 1ᵀw = 1 has a closed-form analogue;
+        // we just check the result is feasible, sums to 1, and sits in
+        // bounds.
+        let mu = DVector::from_vec(vec![0.10, 0.20]);
+        let cov = diag(&[0.04, 0.16]);
+        let mut ef = EfficientFrontier::new(mu, cov).unwrap();
+        let w = ef.max_quadratic_utility(2.0, None).unwrap();
+        let total: f64 = w.iter().sum();
+        assert_relative_eq!(total, 1.0, epsilon = 1e-6);
+        for v in w.iter() {
+            assert!(*v >= -1e-6 && *v <= 1.0 + 1e-6);
+        }
+    }
+
+    #[test]
+    fn l2_reg_pulls_toward_equal_weight() {
+        // With γ very large the L2 term dominates and pushes weights
+        // toward the unconstrained-equal-weight direction.
+        let mu = DVector::from_vec(vec![0.01, 0.02, 0.03]);
+        let cov = diag(&[0.01, 0.01, 0.01]);
+        let mut ef = EfficientFrontier::new(mu, cov)
+            .unwrap()
+            .with_l2_reg(1000.0)
+            .unwrap();
+        let w = ef.min_volatility().unwrap();
+        // Each weight should be near 1/3.
+        for i in 0..3 {
+            assert!((w[i] - 1.0 / 3.0).abs() < 0.05);
+        }
+    }
+
+    #[test]
+    fn market_neutral_min_vol_sums_to_zero() {
+        let mu = DVector::from_vec(vec![0.05, 0.10]);
+        let cov = diag(&[0.04, 0.09]);
+        let mut ef = EfficientFrontier::new(mu, cov)
+            .unwrap()
+            .with_uniform_bounds(-1.0, 1.0)
+            .with_market_neutral(true);
+        let w = ef.min_volatility().unwrap();
+        let total: f64 = w.iter().sum();
+        assert!(total.abs() < 1e-3, "1ᵀw = {total} should be ≈ 0");
     }
 
     #[test]

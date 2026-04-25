@@ -4,10 +4,72 @@
 //! returns are derived internally via simple percent change. Outputs are
 //! annualised `N x N` covariance matrices.
 
-use nalgebra::{DMatrix, DVector};
+use nalgebra::{DMatrix, DVector, SymmetricEigen};
 
 use crate::prelude::{column_means, returns_from_prices, sample_covariance, symmetrise};
 use crate::{PortfolioError, Result, TRADING_DAYS_PER_YEAR};
+
+/// Default daily benchmark used by [`semicovariance`] when none is
+/// supplied. Matches PyPortfolioOpt: `(1 + 0.02)^(1/252) - 1`.
+pub const DEFAULT_SEMICOV_BENCHMARK: f64 = 0.000079;
+
+/// How to repair a covariance matrix that has negative eigenvalues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixMethod {
+    /// Spectral repair: clip negative eigenvalues to zero and rebuild.
+    Spectral,
+    /// Diagonal load: shift the diagonal by `1.1 * |min_eig|`.
+    Diag,
+}
+
+impl Default for FixMethod {
+    fn default() -> Self {
+        FixMethod::Spectral
+    }
+}
+
+/// Repair a covariance matrix so it is positive semi-definite. Mirrors
+/// `pypfopt.risk_models.fix_nonpositive_semidefinite`. If `matrix` is
+/// already PSD (eigenvalues `≥ -1e-12`) it is returned unchanged.
+pub fn fix_nonpositive_semidefinite(matrix: &DMatrix<f64>, method: FixMethod) -> Result<DMatrix<f64>> {
+    let n = crate::prelude::assert_square(matrix, "fix_nonpositive_semidefinite")?;
+    // Symmetrise before decomposing — small asymmetries can flip
+    // eigenvalues, which matters when we're trying to detect non-PSDness.
+    let mut sym = matrix.clone();
+    symmetrise(&mut sym);
+    let eig = SymmetricEigen::new(sym.clone());
+    let min_eig = eig.eigenvalues.iter().cloned().fold(f64::INFINITY, f64::min);
+    if min_eig >= -1e-12 {
+        return Ok(sym);
+    }
+    let fixed = match method {
+        FixMethod::Spectral => {
+            let mut clipped = eig.eigenvalues.clone();
+            for v in clipped.iter_mut() {
+                if *v < 0.0 {
+                    *v = 0.0;
+                }
+            }
+            let v = &eig.eigenvectors;
+            let mut diag = DMatrix::<f64>::zeros(n, n);
+            for i in 0..n {
+                diag[(i, i)] = clipped[i];
+            }
+            v * diag * v.transpose()
+        }
+        FixMethod::Diag => {
+            let shift = -1.1 * min_eig;
+            let mut out = sym.clone();
+            for i in 0..n {
+                out[(i, i)] += shift;
+            }
+            out
+        }
+    };
+    let mut out = fixed;
+    symmetrise(&mut out);
+    Ok(out)
+}
 
 /// Plain sample covariance, annualised.
 pub fn sample_cov(prices: &DMatrix<f64>, frequency: Option<usize>) -> Result<DMatrix<f64>> {
@@ -18,12 +80,14 @@ pub fn sample_cov(prices: &DMatrix<f64>, frequency: Option<usize>) -> Result<DMa
 }
 
 /// Semi-covariance: covariance computed only over downside deviations
-/// below `benchmark` (per-period).
+/// below `benchmark` (per-period). Pass `None` to use
+/// [`DEFAULT_SEMICOV_BENCHMARK`] (PyPortfolioOpt's daily-rf default).
 pub fn semicovariance(
     prices: &DMatrix<f64>,
-    benchmark: f64,
+    benchmark: Option<f64>,
     frequency: Option<usize>,
 ) -> Result<DMatrix<f64>> {
+    let benchmark = benchmark.unwrap_or(DEFAULT_SEMICOV_BENCHMARK);
     let returns = returns_from_prices(prices)?;
     let (rows, cols) = returns.shape();
     if rows < 2 {
@@ -151,9 +215,61 @@ pub fn corr_to_cov(corr: &DMatrix<f64>, std: &DVector<f64>) -> Result<DMatrix<f6
     Ok(cov)
 }
 
+/// String-based dispatcher mirroring `pypfopt.risk_models.risk_matrix`.
+/// Accepted methods (case-insensitive): `sample_cov`, `semicovariance` /
+/// `semivariance`, `exp_cov`, `ledoit_wolf` (alias of
+/// `ledoit_wolf_constant_variance`), `ledoit_wolf_constant_variance`,
+/// `ledoit_wolf_single_factor`, `ledoit_wolf_constant_correlation`,
+/// `oracle_approximating`.
+pub fn risk_matrix(
+    prices: &DMatrix<f64>,
+    method: &str,
+    frequency: Option<usize>,
+) -> Result<DMatrix<f64>> {
+    let m = method.trim().to_ascii_lowercase();
+    match m.as_str() {
+        "sample_cov" => sample_cov(prices, frequency),
+        "semicovariance" | "semivariance" => semicovariance(prices, None, frequency),
+        "exp_cov" => exp_cov(prices, 180, frequency),
+        "ledoit_wolf" | "ledoit_wolf_constant_variance" => CovarianceShrinkage::new(prices, frequency)?
+            .ledoit_wolf(LedoitWolfTarget::ConstantVariance),
+        "ledoit_wolf_single_factor" => CovarianceShrinkage::new(prices, frequency)?
+            .ledoit_wolf(LedoitWolfTarget::SingleFactor),
+        "ledoit_wolf_constant_correlation" => CovarianceShrinkage::new(prices, frequency)?
+            .ledoit_wolf(LedoitWolfTarget::ConstantCorrelation),
+        "oracle_approximating" => CovarianceShrinkage::new(prices, frequency)?
+            .oracle_approximating(),
+        other => Err(PortfolioError::InvalidArgument(format!(
+            "unknown risk_matrix method '{other}'"
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Covariance shrinkage
 // ---------------------------------------------------------------------------
+
+/// Choice of shrinkage target for [`CovarianceShrinkage::ledoit_wolf`].
+/// Mirrors PyPortfolioOpt's `shrinkage_target` argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedoitWolfTarget {
+    /// Identity scaled by the average sample variance — sklearn's default
+    /// and PyPortfolioOpt's default.
+    ConstantVariance,
+    /// One-factor model: target is `β β^T / σ²_m` with the diagonal
+    /// replaced by the sample variances. The "factor" is the equal-
+    /// weighted basket return. Ledoit & Wolf (2001).
+    SingleFactor,
+    /// Constant-correlation target: average pairwise correlation blended
+    /// with the original variances. Ledoit & Wolf (2003).
+    ConstantCorrelation,
+}
+
+impl Default for LedoitWolfTarget {
+    fn default() -> Self {
+        LedoitWolfTarget::ConstantVariance
+    }
+}
 
 /// Shrinkage estimators that pull a sample covariance toward a structured
 /// target. Construct from a price matrix, then call one of the methods to
@@ -163,6 +279,8 @@ pub struct CovarianceShrinkage {
     pub returns: DMatrix<f64>,
     /// Annualisation factor.
     pub frequency: f64,
+    /// Last shrinkage intensity used (populated after each call).
+    pub delta: f64,
 }
 
 impl CovarianceShrinkage {
@@ -171,7 +289,18 @@ impl CovarianceShrinkage {
         Ok(Self {
             returns,
             frequency: frequency.unwrap_or(TRADING_DAYS_PER_YEAR) as f64,
+            delta: 0.0,
         })
+    }
+
+    /// Construct from a returns matrix directly (PyPortfolioOpt's
+    /// `returns_data=True` path).
+    pub fn from_returns(returns: DMatrix<f64>, frequency: Option<usize>) -> Self {
+        Self {
+            returns,
+            frequency: frequency.unwrap_or(TRADING_DAYS_PER_YEAR) as f64,
+            delta: 0.0,
+        }
     }
 
     /// Number of observations.
@@ -244,9 +373,236 @@ impl CovarianceShrinkage {
         (centered, means)
     }
 
-    /// Ledoit-Wolf shrinkage with the constant-correlation target
-    /// (Ledoit & Wolf 2003). Returns annualised covariance.
-    pub fn ledoit_wolf(&self) -> Result<DMatrix<f64>> {
+    /// Manual shrinkage toward an identity-scaled-by-mean-variance target
+    /// with a fixed intensity `delta`. Mirrors
+    /// `pypfopt.CovarianceShrinkage.shrunk_covariance(delta=0.2)`.
+    pub fn shrunk_covariance(&mut self, delta: f64) -> Result<DMatrix<f64>> {
+        if !(0.0..=1.0).contains(&delta) {
+            return Err(PortfolioError::InvalidArgument(
+                "delta must be in [0, 1]".into(),
+            ));
+        }
+        let sample = self.sample_cov_raw()?;
+        let target = self.constant_variance_target(&sample);
+        self.delta = delta;
+        let shrunk = self.shrink_toward(&sample, &target, delta);
+        Ok(shrunk * self.frequency)
+    }
+
+    /// Identity-scaled-by-average-variance target (sklearn default).
+    fn constant_variance_target(&self, sample: &DMatrix<f64>) -> DMatrix<f64> {
+        let n = self.n();
+        let mu: f64 = (0..n).map(|i| sample[(i, i)]).sum::<f64>() / n as f64;
+        DMatrix::<f64>::identity(n, n) * mu
+    }
+
+    /// Ledoit-Wolf shrinkage with the chosen target. Returns annualised
+    /// covariance and stores the optimal shrinkage intensity in
+    /// [`Self::delta`].
+    pub fn ledoit_wolf(&mut self, target: LedoitWolfTarget) -> Result<DMatrix<f64>> {
+        match target {
+            LedoitWolfTarget::ConstantVariance => self.lw_constant_variance(),
+            LedoitWolfTarget::SingleFactor => self.lw_single_factor(),
+            LedoitWolfTarget::ConstantCorrelation => self.lw_constant_correlation(),
+        }
+    }
+
+    /// sklearn-compatible LW with the identity-mean-variance target.
+    fn lw_constant_variance(&mut self) -> Result<DMatrix<f64>> {
+        let t = self.t();
+        let n = self.n();
+        if t < 2 {
+            return Err(PortfolioError::InvalidArgument(
+                "need at least two observations for Ledoit-Wolf".into(),
+            ));
+        }
+        let tt = t as f64;
+        let nn = n as f64;
+        let (centered, _) = self.centered();
+        // Biased empirical covariance S = X^T X / T (centered, divisor T).
+        let mut s = DMatrix::<f64>::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                let mut acc = 0.0;
+                for k in 0..t {
+                    acc += centered[(k, i)] * centered[(k, j)];
+                }
+                s[(i, j)] = acc / tt;
+            }
+        }
+        let mu: f64 = (0..n).map(|i| s[(i, i)]).sum::<f64>() / nn;
+        // δ² = ||S - μI||²_F = sum(S²) - N μ²
+        let mut s_frob_sq = 0.0;
+        for v in s.iter() {
+            s_frob_sq += v * v;
+        }
+        let delta_sq = s_frob_sq - nn * mu * mu;
+        // β̄² = (1/T²) Σ_t ||x_t x_tᵀ - S||²_F = (1/T²) Σ_t ||x_t||⁴ - (1/T) ||S||²_F
+        let mut sum_x4 = 0.0;
+        for k in 0..t {
+            let mut nm2 = 0.0;
+            for i in 0..n {
+                nm2 += centered[(k, i)] * centered[(k, i)];
+            }
+            sum_x4 += nm2 * nm2;
+        }
+        let beta_bar_sq = sum_x4 / (tt * tt) - s_frob_sq / tt;
+        // β² is bounded by δ² to keep shrinkage in [0, 1].
+        let beta_sq = beta_bar_sq.min(delta_sq);
+        let delta = if delta_sq > 0.0 { (beta_sq / delta_sq).clamp(0.0, 1.0) } else { 0.0 };
+        let target = DMatrix::<f64>::identity(n, n) * mu;
+        let shrunk = self.shrink_toward(&s, &target, delta);
+        self.delta = delta;
+        Ok(shrunk * self.frequency)
+    }
+
+    /// LW with the single-factor target (Ledoit & Wolf 2001).
+    fn lw_single_factor(&mut self) -> Result<DMatrix<f64>> {
+        let t = self.t();
+        let n = self.n();
+        if t < 2 {
+            return Err(PortfolioError::InvalidArgument(
+                "need at least two observations for Ledoit-Wolf".into(),
+            ));
+        }
+        let tt = t as f64;
+        let (centered, _) = self.centered();
+        // S = X^T X / T (biased, centered) — matches PyPortfolioOpt's helper.
+        let mut s = DMatrix::<f64>::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                let mut acc = 0.0;
+                for k in 0..t {
+                    acc += centered[(k, i)] * centered[(k, j)];
+                }
+                s[(i, j)] = acc / tt;
+            }
+        }
+        // Equal-weight factor and its variance.
+        let mut xmkt = DVector::<f64>::zeros(t);
+        for i in 0..t {
+            let mut sum = 0.0;
+            for j in 0..n {
+                sum += centered[(i, j)];
+            }
+            xmkt[i] = sum / n as f64;
+        }
+        let var_mkt: f64 = xmkt.iter().map(|v| v * v).sum::<f64>() / tt;
+        if var_mkt <= 0.0 {
+            return Err(PortfolioError::InvalidArgument(
+                "single-factor variance is zero or negative".into(),
+            ));
+        }
+        // β_j = cov(j, mkt) / var(mkt), biased divisor T.
+        let mut betas = DVector::<f64>::zeros(n);
+        for j in 0..n {
+            let mut acc = 0.0;
+            for i in 0..t {
+                acc += centered[(i, j)] * xmkt[i];
+            }
+            betas[j] = (acc / tt) / var_mkt;
+        }
+        // F = β βᵀ * var_mkt with the diagonal swapped to sample variances.
+        let mut f = DMatrix::<f64>::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                f[(i, j)] = if i == j {
+                    s[(i, i)]
+                } else {
+                    betas[i] * betas[j] * var_mkt
+                };
+            }
+        }
+        // Closely follows PyPortfolioOpt's port of the L&W 2001 paper.
+        let c = {
+            let mut acc = 0.0;
+            for i in 0..n {
+                for j in 0..n {
+                    let d = s[(i, j)] - f[(i, j)];
+                    acc += d * d;
+                }
+            }
+            acc
+        };
+        let y = {
+            let mut m = DMatrix::<f64>::zeros(t, n);
+            for i in 0..t {
+                for j in 0..n {
+                    let v = centered[(i, j)];
+                    m[(i, j)] = v * v;
+                }
+            }
+            m
+        };
+        // p = (1/T) sum(yᵀ y) - sum(S²)
+        let yty = y.transpose() * &y;
+        let sum_yty: f64 = yty.iter().sum();
+        let sum_s_sq: f64 = s.iter().map(|v| v * v).sum();
+        let p = sum_yty / tt - sum_s_sq;
+        // r_diag = (1/T) sum(y²) - sum(diag(S)²)
+        let sum_y_sq: f64 = y.iter().map(|v| v * v).sum();
+        let sum_diag_s_sq: f64 = (0..n).map(|i| s[(i, i)] * s[(i, i)]).sum::<f64>();
+        let r_diag = sum_y_sq / tt - sum_diag_s_sq;
+        // z[t,j] = centered[t,j] * xmkt[t]
+        let mut z = DMatrix::<f64>::zeros(t, n);
+        for i in 0..t {
+            for j in 0..n {
+                z[(i, j)] = centered[(i, j)] * xmkt[i];
+            }
+        }
+        // v1 = (1/T) yᵀ z - tile(β, n) * S    where tile(β, n) is a column-broadcast (n x n)
+        let ytz = y.transpose() * &z;
+        let mut v1 = DMatrix::<f64>::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                v1[(i, j)] = ytz[(i, j)] / tt - betas[i] * s[(i, j)];
+            }
+        }
+        // roff1 = sum(v1 .* tile(βᵀ, n)) / var_mkt - sum(diag(v1) * βᵀ) / var_mkt
+        let mut roff1 = 0.0;
+        for i in 0..n {
+            for j in 0..n {
+                roff1 += v1[(i, j)] * betas[j];
+            }
+        }
+        roff1 /= var_mkt;
+        let mut diag_term = 0.0;
+        for i in 0..n {
+            diag_term += v1[(i, i)] * betas[i];
+        }
+        roff1 -= diag_term / var_mkt;
+        // v3 = (1/T) zᵀ z - var_mkt * S
+        let ztz = z.transpose() * &z;
+        let mut v3 = DMatrix::<f64>::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                v3[(i, j)] = ztz[(i, j)] / tt - var_mkt * s[(i, j)];
+            }
+        }
+        // roff3 = sum(v3 .* (β βᵀ)) / var_mkt² - sum(diag(v3) * β²) / var_mkt²
+        let mut roff3 = 0.0;
+        for i in 0..n {
+            for j in 0..n {
+                roff3 += v3[(i, j)] * betas[i] * betas[j];
+            }
+        }
+        roff3 /= var_mkt * var_mkt;
+        let mut roff3b = 0.0;
+        for i in 0..n {
+            roff3b += v3[(i, i)] * betas[i] * betas[i];
+        }
+        roff3 -= roff3b / (var_mkt * var_mkt);
+        let roff = 2.0 * roff1 - roff3;
+        let r = r_diag + roff;
+        let k = if c > 0.0 { (p - r) / c } else { 0.0 };
+        let delta = (k / tt).clamp(0.0, 1.0);
+        let shrunk = self.shrink_toward(&s, &f, delta);
+        self.delta = delta;
+        Ok(shrunk * self.frequency)
+    }
+
+    /// LW with the constant-correlation target (Ledoit & Wolf 2003).
+    fn lw_constant_correlation(&mut self) -> Result<DMatrix<f64>> {
         let t = self.t() as f64;
         if t < 2.0 {
             return Err(PortfolioError::InvalidArgument(
@@ -347,6 +703,7 @@ impl CovarianceShrinkage {
         let delta = (kappa / t).clamp(0.0, 1.0);
 
         let shrunk = self.shrink_toward(&sample, &target, delta);
+        self.delta = delta;
         Ok(shrunk * self.frequency)
     }
 
@@ -428,7 +785,7 @@ mod tests {
         // `min(r - target, 0)²`, annualised. Reproduce the formula directly
         // and compare element-wise.
         let p = make_prices(11);
-        let semi = semicovariance(&p, 0.0, Some(252)).unwrap();
+        let semi = semicovariance(&p, Some(0.0), Some(252)).unwrap();
         let returns = returns_from_prices(&p).unwrap();
         let (t, n) = returns.shape();
         for i in 0..n {
@@ -486,15 +843,62 @@ mod tests {
     #[test]
     fn ledoit_wolf_runs_and_is_symmetric() {
         let p = make_prices(19);
-        let shrunk = CovarianceShrinkage::new(&p, Some(252))
-            .unwrap()
-            .ledoit_wolf()
-            .unwrap();
+        let mut cs = CovarianceShrinkage::new(&p, Some(252)).unwrap();
+        let shrunk = cs.ledoit_wolf(LedoitWolfTarget::ConstantVariance).unwrap();
         for i in 0..3 {
             for j in 0..3 {
                 assert_relative_eq!(shrunk[(i, j)], shrunk[(j, i)], max_relative = 1e-9);
             }
             assert!(shrunk[(i, i)] > 0.0);
+        }
+        assert!((0.0..=1.0).contains(&cs.delta));
+    }
+
+    #[test]
+    fn ledoit_wolf_all_targets_produce_psd() {
+        let p = make_prices(31);
+        for target in [
+            LedoitWolfTarget::ConstantVariance,
+            LedoitWolfTarget::SingleFactor,
+            LedoitWolfTarget::ConstantCorrelation,
+        ] {
+            let mut cs = CovarianceShrinkage::new(&p, Some(252)).unwrap();
+            let shrunk = cs.ledoit_wolf(target).unwrap();
+            for i in 0..3 {
+                for j in 0..3 {
+                    assert_relative_eq!(shrunk[(i, j)], shrunk[(j, i)], max_relative = 1e-9);
+                }
+                assert!(shrunk[(i, i)] > 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn shrunk_covariance_intensity_validation() {
+        let p = make_prices(29);
+        let mut cs = CovarianceShrinkage::new(&p, Some(252)).unwrap();
+        assert!(cs.shrunk_covariance(-0.1).is_err());
+        assert!(cs.shrunk_covariance(1.5).is_err());
+        let shrunk = cs.shrunk_covariance(0.2).unwrap();
+        assert_relative_eq!(cs.delta, 0.2, max_relative = 1e-12);
+        for i in 0..3 {
+            assert!(shrunk[(i, i)] > 0.0);
+        }
+    }
+
+    #[test]
+    fn fix_nonpositive_semidefinite_repairs_negatives() {
+        // Build an obviously non-PSD symmetric matrix and check the
+        // repaired version has non-negative eigenvalues.
+        let m = DMatrix::from_row_slice(3, 3, &[
+            1.0, 0.9, 0.9,
+            0.9, 1.0, -0.95,
+            0.9, -0.95, 1.0,
+        ]);
+        let fixed = fix_nonpositive_semidefinite(&m, FixMethod::Spectral).unwrap();
+        let eig = SymmetricEigen::new(fixed);
+        for v in eig.eigenvalues.iter() {
+            assert!(*v >= -1e-10, "eigenvalue {v} not >= 0 after repair");
         }
     }
 

@@ -95,6 +95,36 @@ pub(crate) fn assert_square(m: &DMatrix<f64>, label: &str) -> Result<usize> {
     Ok(r)
 }
 
+/// Round entries of `weights` whose absolute value is below `cutoff` to
+/// zero, renormalise the remainder so they sum to the original total,
+/// and optionally round to `rounding` decimal places. Mirrors
+/// PyPortfolioOpt's `base_optimizer.BaseOptimizer.clean_weights`.
+pub fn clean_weights(
+    weights: &DVector<f64>,
+    cutoff: f64,
+    rounding: Option<u32>,
+) -> DVector<f64> {
+    let mut cleaned = weights.clone();
+    for v in cleaned.iter_mut() {
+        if v.abs() < cutoff {
+            *v = 0.0;
+        }
+    }
+    let total: f64 = cleaned.iter().sum();
+    if total.abs() > 1e-12 {
+        for v in cleaned.iter_mut() {
+            *v /= total;
+        }
+    }
+    if let Some(places) = rounding {
+        let factor = 10f64.powi(places as i32);
+        for v in cleaned.iter_mut() {
+            *v = (*v * factor).round() / factor;
+        }
+    }
+    cleaned
+}
+
 /// Symmetrise a matrix in-place (`(A + A^T) / 2`). Useful after numerical
 /// operations that produce minute asymmetry.
 pub fn symmetrise(m: &mut DMatrix<f64>) {

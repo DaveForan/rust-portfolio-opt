@@ -37,6 +37,10 @@ pub struct DiscreteAllocation {
     pub prices: DVector<f64>,
     /// Total cash budget.
     pub total_portfolio_value: f64,
+    /// Fraction of the portfolio dedicated to short positions (e.g. 0.3 →
+    /// 130/30). When `None`, derived from the weights as
+    /// `sum(-w for w in weights if w < 0)`.
+    pub short_ratio: Option<f64>,
 }
 
 impl DiscreteAllocation {
@@ -65,56 +69,108 @@ impl DiscreteAllocation {
                 )));
             }
         }
-        Ok(Self { weights, prices, total_portfolio_value })
+        Ok(Self {
+            weights,
+            prices,
+            total_portfolio_value,
+            short_ratio: None,
+        })
     }
 
-    /// Greedy allocation.
+    /// Override the short ratio (e.g. 0.3 for a 130/30 portfolio).
+    pub fn with_short_ratio(mut self, short_ratio: f64) -> Result<Self> {
+        if short_ratio < 0.0 {
+            return Err(PortfolioError::InvalidArgument(
+                "short_ratio must be non-negative".into(),
+            ));
+        }
+        self.short_ratio = Some(short_ratio);
+        Ok(self)
+    }
+
+    fn effective_short_ratio(&self) -> f64 {
+        if let Some(r) = self.short_ratio {
+            return r;
+        }
+        self.weights.iter().filter(|w| **w < 0.0).map(|w| -w).sum()
+    }
+
+    /// Greedy allocation with the default options (no reinvestment of
+    /// short proceeds, silent). Shortcut for
+    /// `greedy_portfolio_with_options(false, false)`.
+    pub fn greedy_portfolio(&self) -> Result<(HashMap<usize, i64>, f64)> {
+        self.greedy_portfolio_with_options(false, false)
+    }
+
+    /// Greedy allocation with full options. When `reinvest` is true the
+    /// proceeds from short positions are added to the long-side budget;
+    /// when false (PyPortfolioOpt default) shorts and longs are budgeted
+    /// independently. `verbose` is a no-op kept for API symmetry.
     ///
     /// Returns `(allocation, leftover)` where `allocation` maps asset
     /// index → number of shares (signed: positive = long, negative = short)
     /// and `leftover` is remaining unallocated cash.
-    pub fn greedy_portfolio(&self) -> Result<(HashMap<usize, i64>, f64)> {
+    pub fn greedy_portfolio_with_options(
+        &self,
+        reinvest: bool,
+        _verbose: bool,
+    ) -> Result<(HashMap<usize, i64>, f64)> {
         let n = self.weights.len();
+        let has_shorts = self.weights.iter().any(|w| *w < 0.0);
+        let short_ratio = self.effective_short_ratio();
 
-        // Ideal (continuous) share count for each asset.
-        let mut ideal = vec![0.0_f64; n];
-        for i in 0..n {
-            ideal[i] = self.weights[i] * self.total_portfolio_value / self.prices[i];
+        // When there are short positions, follow PyPortfolioOpt's split:
+        // long side gets `tpv` (or `tpv * (1 + short_ratio)` if reinvest
+        // is set), short side gets `tpv * short_ratio` of "borrow".
+        let (long_budget, short_budget) = if has_shorts && short_ratio > 0.0 {
+            let short_val = self.total_portfolio_value * short_ratio;
+            let long_val = if reinvest {
+                self.total_portfolio_value + short_val
+            } else {
+                self.total_portfolio_value
+            };
+            (long_val, short_val)
+        } else {
+            (self.total_portfolio_value, 0.0)
+        };
+
+        // Long-side allocation.
+        let long_indices: Vec<usize> = (0..n).filter(|&i| self.weights[i] > 0.0).collect();
+        let long_total: f64 = long_indices.iter().map(|&i| self.weights[i]).sum();
+        let mut shares = vec![0_i64; n];
+        let mut leftover_long = long_budget;
+        if long_total > 0.0 && long_budget > 0.0 {
+            let (s, lo) = greedy_one_side(
+                &long_indices,
+                &self.weights,
+                &self.prices,
+                long_budget,
+                long_total,
+                false,
+            );
+            for (i, sh) in s {
+                shares[i] = sh;
+            }
+            leftover_long = lo;
         }
 
-        // Floor toward zero for every position.
-        let mut shares: Vec<i64> = ideal.iter().map(|&x| x.trunc() as i64).collect();
-        let spent: f64 = (0..n)
-            .map(|i| shares[i] as f64 * self.prices[i])
-            .sum();
-        let mut remaining = self.total_portfolio_value - spent;
-
-        // Sort assets by fractional remainder (descending) to decide
-        // where to allocate leftover cash.
-        let mut fracs: Vec<(usize, f64)> = (0..n)
-            .map(|i| {
-                let frac = ideal[i] - ideal[i].trunc();
-                // For short positions the "fractional" shortfall is 1 - |frac|
-                // so we weight by how "close" they are to needing one more share.
-                let priority = if ideal[i] >= 0.0 { frac } else { 1.0 + frac };
-                (i, priority)
-            })
-            .collect();
-        fracs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Greedily buy/sell one additional share per asset if affordable.
-        for (i, _) in &fracs {
-            let price = self.prices[*i];
-            if ideal[*i] >= 0.0 {
-                // Long: buy one more share if we have cash.
-                if remaining >= price - 1e-9 {
-                    shares[*i] += 1;
-                    remaining -= price;
-                }
-            } else {
-                // Short: the floor already rounds toward zero; there is
-                // no "buy more" action needed.
+        // Short-side allocation (if any).
+        let short_indices: Vec<usize> = (0..n).filter(|&i| self.weights[i] < 0.0).collect();
+        let short_total: f64 = short_indices.iter().map(|&i| -self.weights[i]).sum();
+        let mut leftover_short = short_budget;
+        if has_shorts && short_total > 0.0 && short_budget > 0.0 {
+            let (s, lo) = greedy_one_side(
+                &short_indices,
+                &self.weights,
+                &self.prices,
+                short_budget,
+                short_total,
+                true,
+            );
+            for (i, sh) in s {
+                shares[i] = sh;
             }
+            leftover_short = lo;
         }
 
         let allocation: HashMap<usize, i64> = shares
@@ -124,7 +180,7 @@ impl DiscreteAllocation {
             .map(|(i, &s)| (i, s))
             .collect();
 
-        Ok((allocation, remaining))
+        Ok((allocation, leftover_long + leftover_short))
     }
 
     /// Rounded allocation — each position is simply rounded to the nearest
@@ -153,6 +209,54 @@ impl DiscreteAllocation {
             .map(|(&i, &s)| s as f64 * self.prices[i])
             .sum()
     }
+}
+
+/// Greedy single-side allocator. `weights` is the *full* weight vector;
+/// only entries listed in `indices` are allocated. When `is_short` is
+/// true the absolute weight is used for sizing and the resulting share
+/// counts are negated.
+fn greedy_one_side(
+    indices: &[usize],
+    weights: &DVector<f64>,
+    prices: &DVector<f64>,
+    budget: f64,
+    weight_total: f64,
+    is_short: bool,
+) -> (Vec<(usize, i64)>, f64) {
+    // Ideal continuous count, scaled so the side's weights are
+    // re-normalised to sum to 1 within the side.
+    let mut ideal = vec![0.0_f64; indices.len()];
+    for (k, &i) in indices.iter().enumerate() {
+        let w = weights[i].abs() / weight_total;
+        ideal[k] = w * budget / prices[i];
+    }
+    let mut shares: Vec<i64> = ideal.iter().map(|&x| x.trunc() as i64).collect();
+    let spent: f64 = (0..indices.len())
+        .map(|k| shares[k] as f64 * prices[indices[k]])
+        .sum();
+    let mut remaining = budget - spent;
+
+    let mut fracs: Vec<(usize, f64)> = (0..indices.len())
+        .map(|k| (k, ideal[k] - ideal[k].trunc()))
+        .collect();
+    fracs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    for (k, _) in &fracs {
+        let i = indices[*k];
+        let price = prices[i];
+        if remaining >= price - 1e-9 {
+            shares[*k] += 1;
+            remaining -= price;
+        }
+    }
+
+    let mut out = Vec::with_capacity(indices.len());
+    for (k, &i) in indices.iter().enumerate() {
+        let s = if is_short { -shares[k] } else { shares[k] };
+        if s != 0 {
+            out.push((i, s));
+        }
+    }
+    (out, remaining)
 }
 
 #[cfg(test)]
@@ -224,6 +328,20 @@ mod tests {
         let (alloc, _) = da.rounded_portfolio().unwrap();
         assert_eq!(*alloc.get(&0).unwrap_or(&0), 51);
         assert_eq!(*alloc.get(&1).unwrap_or(&0), 51);
+    }
+
+    #[test]
+    fn greedy_handles_signed_weights_with_shorts() {
+        // 130/30: 130% long, 30% short. Long weights sum to 1.3, short to 0.3.
+        let weights = DVector::from_vec(vec![0.7, 0.6, -0.3]);
+        let prices = DVector::from_vec(vec![100.0, 200.0, 50.0]);
+        let da = DiscreteAllocation::new(weights, prices, 10_000.0).unwrap();
+        let (alloc, _leftover) = da.greedy_portfolio().unwrap();
+        // Shorts are signed negative.
+        assert!(alloc.get(&2).copied().unwrap_or(0) < 0);
+        // Longs are positive.
+        assert!(alloc.get(&0).copied().unwrap_or(0) > 0);
+        assert!(alloc.get(&1).copied().unwrap_or(0) > 0);
     }
 
     #[test]

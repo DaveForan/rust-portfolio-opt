@@ -32,27 +32,50 @@ fn build_returns(prices: &DMatrix<f64>, kind: ReturnsKind) -> Result<DMatrix<f64
 /// Annualised mean of historical returns.
 ///
 /// `frequency` is the number of periods per year (252 for daily). Defaults
-/// to [`TRADING_DAYS_PER_YEAR`] when `None`.
+/// to [`TRADING_DAYS_PER_YEAR`] when `None`. When `compounding` is true
+/// (PyPortfolioOpt default) the result is the CAGR-style geometric mean
+/// `(∏(1 + r))^(f/T) − 1`. When false the result is the arithmetic mean
+/// times `f`.
 pub fn mean_historical_return(
     prices: &DMatrix<f64>,
     kind: ReturnsKind,
+    compounding: bool,
     frequency: Option<usize>,
 ) -> Result<DVector<f64>> {
     let returns = build_returns(prices, kind)?;
-    let mu = column_means(&returns);
+    let (rows, cols) = returns.shape();
+    if rows == 0 {
+        return Err(PortfolioError::InvalidArgument(
+            "no return observations".into(),
+        ));
+    }
     let f = frequency.unwrap_or(TRADING_DAYS_PER_YEAR) as f64;
-    Ok(mu * f)
+    if compounding {
+        let mut mu = DVector::<f64>::zeros(cols);
+        for j in 0..cols {
+            let mut prod = 1.0_f64;
+            for i in 0..rows {
+                prod *= 1.0 + returns[(i, j)];
+            }
+            mu[j] = prod.powf(f / rows as f64) - 1.0;
+        }
+        Ok(mu)
+    } else {
+        let mu = column_means(&returns);
+        Ok(mu * f)
+    }
 }
 
 /// Exponentially-weighted mean of historical returns.
 ///
 /// `span` is the EMA span (PyPortfolioOpt default is 500). Weights follow
 /// `alpha = 2 / (span + 1)`, applied with the most-recent observation
-/// receiving the largest weight. The result is then annualised by
-/// `frequency`.
+/// receiving the largest weight. When `compounding` is true the EMA mean
+/// `m` is annualised as `(1 + m)^f - 1`; otherwise as `m * f`.
 pub fn ema_historical_return(
     prices: &DMatrix<f64>,
     kind: ReturnsKind,
+    compounding: bool,
     span: usize,
     frequency: Option<usize>,
 ) -> Result<DVector<f64>> {
@@ -93,7 +116,11 @@ pub fn ema_historical_return(
     }
 
     let f = frequency.unwrap_or(TRADING_DAYS_PER_YEAR) as f64;
-    Ok(mu * f)
+    if compounding {
+        Ok(mu.map(|m| (1.0 + m).powf(f) - 1.0))
+    } else {
+        Ok(mu * f)
+    }
 }
 
 /// CAPM-implied expected returns.
@@ -183,7 +210,7 @@ mod tests {
     #[test]
     fn mean_simple_matches_constant_growth() {
         let p = linear_prices();
-        let mu = mean_historical_return(&p, ReturnsKind::Simple, Some(252)).unwrap();
+        let mu = mean_historical_return(&p, ReturnsKind::Simple, false, Some(252)).unwrap();
         assert_relative_eq!(mu[0], 0.01 * 252.0, max_relative = 1e-9);
         assert_relative_eq!(mu[1], 0.02 * 252.0, max_relative = 1e-9);
     }
@@ -191,24 +218,43 @@ mod tests {
     #[test]
     fn mean_log_matches_constant_growth() {
         let p = linear_prices();
-        let mu = mean_historical_return(&p, ReturnsKind::Log, Some(252)).unwrap();
+        let mu = mean_historical_return(&p, ReturnsKind::Log, false, Some(252)).unwrap();
         assert_relative_eq!(mu[0], 0.01_f64.ln_1p() * 252.0, max_relative = 1e-9);
         assert_relative_eq!(mu[1], 0.02_f64.ln_1p() * 252.0, max_relative = 1e-9);
+    }
+
+    #[test]
+    fn mean_compounding_matches_cagr() {
+        // 10 returns of 1% each → ∏(1+r) = 1.01^10. CAGR with f=252 is
+        // (1.01^10)^(252/10) - 1 = 1.01^252 - 1.
+        let p = linear_prices();
+        let mu = mean_historical_return(&p, ReturnsKind::Simple, true, Some(252)).unwrap();
+        assert_relative_eq!(mu[0], 1.01_f64.powf(252.0) - 1.0, max_relative = 1e-9);
+        assert_relative_eq!(mu[1], 1.02_f64.powf(252.0) - 1.0, max_relative = 1e-9);
     }
 
     #[test]
     fn ema_recovers_constant_returns() {
         // Constant returns -> EMA = constant regardless of span.
         let p = linear_prices();
-        let mu = ema_historical_return(&p, ReturnsKind::Simple, 5, Some(252)).unwrap();
+        let mu = ema_historical_return(&p, ReturnsKind::Simple, false, 5, Some(252)).unwrap();
         assert_relative_eq!(mu[0], 0.01 * 252.0, max_relative = 1e-9);
         assert_relative_eq!(mu[1], 0.02 * 252.0, max_relative = 1e-9);
     }
 
     #[test]
+    fn ema_compounding_annualises_correctly() {
+        // Constant returns: EMA mean = 0.01, compounded annual = 1.01^252 - 1.
+        let p = linear_prices();
+        let mu = ema_historical_return(&p, ReturnsKind::Simple, true, 5, Some(252)).unwrap();
+        assert_relative_eq!(mu[0], 1.01_f64.powf(252.0) - 1.0, max_relative = 1e-9);
+        assert_relative_eq!(mu[1], 1.02_f64.powf(252.0) - 1.0, max_relative = 1e-9);
+    }
+
+    #[test]
     fn ema_invalid_span_errors() {
         let p = linear_prices();
-        assert!(ema_historical_return(&p, ReturnsKind::Simple, 0, None).is_err());
+        assert!(ema_historical_return(&p, ReturnsKind::Simple, false, 0, None).is_err());
     }
 
     #[test]

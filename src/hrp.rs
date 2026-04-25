@@ -16,8 +16,32 @@ use crate::prelude::{returns_from_prices, sample_covariance};
 use crate::risk_models::cov_to_corr;
 use crate::{PortfolioError, Result};
 
+/// Linkage method used during HRP's agglomerative clustering. Mirrors
+/// scipy's `linkage(method=...)`: `single` = nearest neighbour,
+/// `complete` = farthest neighbour, `average` = unweighted mean
+/// (UPGMA). Default is [`LinkageMethod::Single`] (PyPortfolioOpt's
+/// default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkageMethod {
+    Single,
+    Complete,
+    Average,
+}
+
+impl Default for LinkageMethod {
+    fn default() -> Self {
+        LinkageMethod::Single
+    }
+}
+
 pub struct HRPOpt {
+    /// Returns matrix used to derive the covariance and clustering.
+    /// Empty if [`Self::from_cov_matrix`] was used.
     pub returns: DMatrix<f64>,
+    /// Override for the covariance matrix (set by `from_cov_matrix`).
+    pub cov_override: Option<DMatrix<f64>>,
+    pub linkage: LinkageMethod,
+    pub weights: Option<DVector<f64>>,
 }
 
 impl HRPOpt {
@@ -27,18 +51,53 @@ impl HRPOpt {
                 "HRP needs at least 2 observations and 2 assets".into(),
             ));
         }
-        Ok(Self { returns })
+        Ok(Self {
+            returns,
+            cov_override: None,
+            linkage: LinkageMethod::default(),
+            weights: None,
+        })
     }
 
     pub fn from_prices(prices: &DMatrix<f64>) -> Result<Self> {
         Self::from_returns(returns_from_prices(prices)?)
     }
 
-    pub fn optimize(&self) -> Result<DVector<f64>> {
-        let cov = sample_covariance(&self.returns)?;
+    /// Build an HRP optimiser directly from a covariance matrix. The
+    /// `returns` field is left empty; only optimisation works.
+    pub fn from_cov_matrix(cov: DMatrix<f64>) -> Result<Self> {
+        crate::prelude::assert_square(&cov, "HRPOpt::from_cov_matrix")?;
+        if cov.nrows() < 2 {
+            return Err(PortfolioError::InvalidArgument(
+                "HRP needs at least 2 assets".into(),
+            ));
+        }
+        Ok(Self {
+            returns: DMatrix::<f64>::zeros(0, cov.nrows()),
+            cov_override: Some(cov),
+            linkage: LinkageMethod::default(),
+            weights: None,
+        })
+    }
+
+    /// Override the linkage method used during clustering.
+    pub fn with_linkage(mut self, method: LinkageMethod) -> Self {
+        self.linkage = method;
+        self
+    }
+
+    fn cov(&self) -> Result<DMatrix<f64>> {
+        if let Some(c) = &self.cov_override {
+            return Ok(c.clone());
+        }
+        sample_covariance(&self.returns)
+    }
+
+    pub fn optimize(&mut self) -> Result<DVector<f64>> {
+        let cov = self.cov()?;
         let corr = cov_to_corr(&cov)?;
         let dist = correlation_distance(&corr);
-        let order = quasi_diagonalise(&dist);
+        let order = quasi_diagonalise_with(&dist, self.linkage);
         let weights_in_order = recursive_bisection(&cov, &order);
 
         let n = order.len();
@@ -46,7 +105,46 @@ impl HRPOpt {
         for (rank, &asset) in order.iter().enumerate() {
             w[asset] = weights_in_order[rank];
         }
+        self.weights = Some(w.clone());
         Ok(w)
+    }
+
+    /// `(annualised return, annualised vol, Sharpe)` from the cached
+    /// HRP weights and a caller-supplied expected-return vector.
+    pub fn portfolio_performance(
+        &self,
+        expected_returns: &DVector<f64>,
+        risk_free_rate: f64,
+    ) -> Result<(f64, f64, f64)> {
+        let w = self.weights.as_ref().ok_or_else(|| {
+            PortfolioError::InvalidArgument(
+                "no weights yet — call optimize before portfolio_performance".into(),
+            )
+        })?;
+        if expected_returns.len() != w.len() {
+            return Err(PortfolioError::DimensionMismatch(format!(
+                "expected_returns length {} ≠ weight length {}",
+                expected_returns.len(),
+                w.len()
+            )));
+        }
+        let cov = self.cov()?;
+        let ret = expected_returns.dot(w);
+        let var = (w.transpose() * &cov * w)[(0, 0)];
+        let vol = var.max(0.0).sqrt();
+        let sharpe = if vol > 0.0 { (ret - risk_free_rate) / vol } else { 0.0 };
+        Ok((ret, vol, sharpe))
+    }
+
+    /// Round weights below `cutoff` to zero, renormalise, optionally
+    /// round to `rounding` decimal places.
+    pub fn clean_weights(&self, cutoff: f64, rounding: Option<u32>) -> Result<DVector<f64>> {
+        let w = self.weights.as_ref().ok_or_else(|| {
+            PortfolioError::InvalidArgument(
+                "no weights yet — call optimize before clean_weights".into(),
+            )
+        })?;
+        Ok(crate::prelude::clean_weights(w, cutoff, rounding))
     }
 }
 
@@ -64,8 +162,14 @@ pub fn correlation_distance(corr: &DMatrix<f64>) -> DMatrix<f64> {
 }
 
 /// Single-linkage agglomerative clustering. Returns the leaf order as a
-/// flat list of asset indices.
+/// flat list of asset indices. Equivalent to
+/// `quasi_diagonalise_with(dist, LinkageMethod::Single)`.
 pub fn quasi_diagonalise(dist: &DMatrix<f64>) -> Vec<usize> {
+    quasi_diagonalise_with(dist, LinkageMethod::Single)
+}
+
+/// Agglomerative clustering with the chosen [`LinkageMethod`].
+pub fn quasi_diagonalise_with(dist: &DMatrix<f64>, method: LinkageMethod) -> Vec<usize> {
     let n = dist.nrows();
     let mut clusters: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
 
@@ -75,14 +179,7 @@ pub fn quasi_diagonalise(dist: &DMatrix<f64>) -> Vec<usize> {
         let mut best_d = f64::INFINITY;
         for i in 0..clusters.len() {
             for j in (i + 1)..clusters.len() {
-                let mut d_ij = f64::INFINITY;
-                for &a in &clusters[i] {
-                    for &b in &clusters[j] {
-                        if dist[(a, b)] < d_ij {
-                            d_ij = dist[(a, b)];
-                        }
-                    }
-                }
+                let d_ij = cluster_distance(dist, &clusters[i], &clusters[j], method);
                 if d_ij < best_d {
                     best_d = d_ij;
                     best_i = i;
@@ -94,6 +191,49 @@ pub fn quasi_diagonalise(dist: &DMatrix<f64>) -> Vec<usize> {
         clusters[best_i].extend(merged_tail);
     }
     clusters.into_iter().next().unwrap_or_default()
+}
+
+fn cluster_distance(
+    dist: &DMatrix<f64>,
+    a: &[usize],
+    b: &[usize],
+    method: LinkageMethod,
+) -> f64 {
+    match method {
+        LinkageMethod::Single => {
+            let mut best = f64::INFINITY;
+            for &x in a {
+                for &y in b {
+                    if dist[(x, y)] < best {
+                        best = dist[(x, y)];
+                    }
+                }
+            }
+            best
+        }
+        LinkageMethod::Complete => {
+            let mut worst = f64::NEG_INFINITY;
+            for &x in a {
+                for &y in b {
+                    if dist[(x, y)] > worst {
+                        worst = dist[(x, y)];
+                    }
+                }
+            }
+            worst
+        }
+        LinkageMethod::Average => {
+            let mut acc = 0.0;
+            let mut count = 0_usize;
+            for &x in a {
+                for &y in b {
+                    acc += dist[(x, y)];
+                    count += 1;
+                }
+            }
+            if count == 0 { f64::INFINITY } else { acc / count as f64 }
+        }
+    }
 }
 
 /// Recursive bisection: split the order in two, weight inversely to
@@ -207,7 +347,7 @@ mod tests {
     #[test]
     fn weights_sum_to_one() {
         let r = synthetic_returns();
-        let hrp = HRPOpt::from_returns(r).unwrap();
+        let mut hrp = HRPOpt::from_returns(r).unwrap();
         let w = hrp.optimize().unwrap();
         let total: f64 = w.iter().sum();
         assert_relative_eq!(total, 1.0, epsilon = 1e-9);
@@ -216,10 +356,49 @@ mod tests {
     #[test]
     fn weights_are_long_only() {
         let r = synthetic_returns();
-        let hrp = HRPOpt::from_returns(r).unwrap();
+        let mut hrp = HRPOpt::from_returns(r).unwrap();
         let w = hrp.optimize().unwrap();
         for v in w.iter() {
             assert!(*v >= 0.0);
         }
+    }
+
+    #[test]
+    fn linkage_methods_all_produce_valid_weights() {
+        let r = synthetic_returns();
+        for method in [
+            LinkageMethod::Single,
+            LinkageMethod::Complete,
+            LinkageMethod::Average,
+        ] {
+            let mut hrp = HRPOpt::from_returns(r.clone()).unwrap().with_linkage(method);
+            let w = hrp.optimize().unwrap();
+            let total: f64 = w.iter().sum();
+            assert_relative_eq!(total, 1.0, epsilon = 1e-9);
+            for v in w.iter() {
+                assert!(*v >= 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn from_cov_matrix_round_trips() {
+        let r = synthetic_returns();
+        let cov = sample_covariance(&r).unwrap();
+        let mut hrp = HRPOpt::from_cov_matrix(cov).unwrap();
+        let w = hrp.optimize().unwrap();
+        let total: f64 = w.iter().sum();
+        assert_relative_eq!(total, 1.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn portfolio_performance_runs() {
+        let r = synthetic_returns();
+        let mut hrp = HRPOpt::from_returns(r).unwrap();
+        hrp.optimize().unwrap();
+        let mu = DVector::from_vec(vec![0.05, 0.06, 0.04, 0.05, 0.03]);
+        let (ret, vol, _sh) = hrp.portfolio_performance(&mu, 0.0).unwrap();
+        assert!(ret.is_finite());
+        assert!(vol > 0.0);
     }
 }

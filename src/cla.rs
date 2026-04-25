@@ -220,6 +220,18 @@ impl CLA {
         Ok((ret, vol, sharpe))
     }
 
+    /// Round weights below `cutoff` to zero, renormalise, optionally
+    /// round to `rounding` decimal places. Mirrors PyPortfolioOpt's
+    /// `clean_weights`.
+    pub fn clean_weights(&self, cutoff: f64, rounding: Option<u32>) -> Result<DVector<f64>> {
+        let w = self.weights.as_ref().ok_or_else(|| {
+            PortfolioError::InvalidArgument(
+                "no weights yet — call an optimiser before clean_weights".into(),
+            )
+        })?;
+        Ok(crate::prelude::clean_weights(w, cutoff, rounding))
+    }
+
     // -----------------------------------------------------------------------
     // Frontier computation
     // -----------------------------------------------------------------------
