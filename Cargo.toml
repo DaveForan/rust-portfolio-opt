@@ -1,0 +1,21 @@
+[package]
+name = "rust-portfolio-opt"
+version = "0.1.0"
+edition = "2021"
+authors = ["Dave Foran <dave@redsunis.com>"]
+description = "Pure-Rust port of PyPortfolioOpt: expected returns, risk models, mean-variance optimisation, Black-Litterman, hierarchical risk parity, the Critical Line Algorithm, and discrete allocation."
+license = "MIT"
+repository = "https://github.com/daveforan/rust-portfolio-opt"
+readme = "README.md"
+keywords = ["portfolio", "finance", "optimization", "markowitz", "quant"]
+categories = ["mathematics", "finance"]
+
+[dependencies]
+nalgebra = { version = "0.33", features = ["serde-serialize"] }
+statrs = "0.17"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+
+[dev-dependencies]
+approx = "0.5"

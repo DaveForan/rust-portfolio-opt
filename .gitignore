@@ -1,0 +1,17 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Pure library — Cargo.lock is excluded so downstream consumers resolve
+# their own dependency versions.
+Cargo.lock
+
+# IDE / OS noise
+.idea/
+.vscode/
+.DS_Store
+
+# Test / debug artefacts
+*.profraw
+flamegraph.svg
+perf.data*
